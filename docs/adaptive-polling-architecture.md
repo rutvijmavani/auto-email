@@ -1950,7 +1950,7 @@ db:maintenance   — set when DB maintenance starts, cleared when complete (no a
 
 #### 11. Full Scan Exclusive Lock (retired)
 
-`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented by the Stream delivery model: a company in the `stream:fullscan` PEL (delivered but not ACK'd) is not re-added by the dispatcher because `ZREM poll:fullscan` already removed it from the scheduling ledger. On a crash the owner-state reaper (not `XAUTOCLAIM`) releases the stale entry for a *different* worker, not a duplicate second dispatch.
+`fullscan:lock:{company}` is a live lease key, not a dispatch guard (it has no TTL; see the lifecycle account near line 1839): the owning fullscan worker sets it and deletes it on completion, the owner-state reaper deletes it when it reaps a dead owner's entry (`_release_inflight`), and `sweep_inflight` deletes it with a leaked slot. Double-dispatch is prevented by the Stream delivery model: a company in the `stream:fullscan` PEL (delivered but not ACK'd) is not re-added by the dispatcher because `ZREM poll:fullscan` already removed it from the scheduling ledger. On a crash the owner-state reaper (not `XAUTOCLAIM`) releases the stale entry for a *different* worker, not a duplicate second dispatch.
 
 #### 12. Company Stats Cache (Hash)
 
@@ -2558,7 +2558,7 @@ See Section 19 for dynamic concurrency details.
 
 ### Full scan double-dispatch protection
 
-`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented structurally by the two-layer delivery model: once the dispatcher `XADD`s a company to `stream:fullscan` and `ZREM`s it from `poll:fullscan`, it no longer exists in the scheduling ledger. A crashed worker leaves the message in the PEL; the owner-state reaper (`claim_stale_work`) releases it for exactly one other worker — not as a second concurrent dispatch.
+`fullscan:lock:{company}` is a live lease key, not a dispatch guard (no TTL: the owning worker deletes it on completion, the owner-state reaper deletes it with a reaped dead owner's slot, and `sweep_inflight` deletes it with a leaked slot). Double-dispatch is prevented structurally by the two-layer delivery model: once the dispatcher `XADD`s a company to `stream:fullscan` and `ZREM`s it from `poll:fullscan`, it no longer exists in the scheduling ledger. A crashed worker leaves the message in the PEL; the owner-state reaper (`claim_stale_work`) releases it for exactly one other worker — not as a second concurrent dispatch.
 
 ### Digest email safety
 

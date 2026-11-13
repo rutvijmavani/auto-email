@@ -208,6 +208,33 @@ def _get_backoff_delay(r, company: str, op_type: str) -> int:
     return backoff_delay_for(count - 1)   # 0-based retry index
 
 
+def _stream_id_tuple(sid) -> tuple:
+    """'1700000000000-3' -> (1700000000000, 3); (0, 0) when unparseable."""
+    s = sid.decode() if isinstance(sid, bytes) else str(sid)
+    try:
+        ms, _, seq = s.partition("-")
+        return int(ms), int(seq or 0)
+    except ValueError:
+        return 0, 0
+
+
+def _is_superseded(r, company: str, msg_id) -> bool:
+    """
+    True when the dispatcher's stored stream id for this company is NEWER than msg_id.
+
+    A missing key or an older/equal stored id means this entry is the live one (the dispatcher
+    sets the key just after XADD, so an older stored id must never cause a drop).  Any Redis
+    error answers False: scanning a duplicate is safer than losing a dispatch.
+    """
+    try:
+        stored = r.get(f"{REDIS_INFLIGHT_MSG_PREFIX}:scan:{company}")
+    except Exception:
+        return False
+    if not stored:
+        return False
+    return _stream_id_tuple(stored) > _stream_id_tuple(msg_id)
+
+
 def backoff_delay_for(retry_count: int) -> int:
     """Backoff delay (s) for a 0-based retry index; retry 5+ gives up for today."""
     if retry_count >= 5:
@@ -873,6 +900,21 @@ def run_worker(once: bool = False, shutdown_event=None,
             scan_context = fields.get("context", "normal")
             enqueued_at  = fields.get("enqueued_at", "")
             request_id   = fields.get("request_id", f"adp-{int(time.time())}")
+
+            # ── Superseded duplicate: a newer dispatch of this company exists ──
+            # The dispatcher stores the id of its latest stream entry per company.  An entry older
+            # than that id is a stale duplicate: close it without scanning (the newer entry runs).
+            if company and _is_superseded(r, company, msg_id):
+                logger.warning(
+                    "scan_worker: dropping superseded duplicate %s for %r (newer dispatch exists)",
+                    msg_id, company,
+                )
+                try:
+                    r.xack(REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, msg_id)
+                except Exception as dup_exc:
+                    logger.error("scan_worker: could not ack duplicate %s for %r: %s",
+                                 msg_id, company, dup_exc)
+                continue
             progress.begin(msg_id, dc_key)
 
             # ── Shutdown checkpoint (after XREADGROUP, before scan) ───────────

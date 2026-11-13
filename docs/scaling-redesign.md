@@ -1669,15 +1669,17 @@ Step 2: If at the seat cap and still short (not all pools can be satisfied):
 
         available = seat cap                      (non-worker connections are already subtracted in it)
 
-        detail_allocation  = min(true_required(detail),  detail_ceil_at_probe)
-        scan_allocation    = min(true_required(scan),    min(scan_ceil_at_probe,   available − detail_allocation))
-        fullscan_allocation = max(WORKER_FLOOR, available − detail_allocation − scan_allocation)
+        every pool first gets max(WORKER_FLOOR, min(ideal, soft ceiling))
+        spare seats are then granted in _SEAT_FILL_ORDER = scan, fullscan, detail
+        (workers/manager.py; decided 2026-10-31): each pool receives
+        min(ideal - allocated, spare) before the next pool is served.
 
-        → fullscan accepts being shorted (lowest priority, not time-critical)
+        → detail is served LAST (it only consumes what scan and fullscan feed it), so it is the
+          pool shorted first when the seats run out
         → alert which pool was shorted and by how much
 ```
 
-This means detail is never shorted if there is any capacity at all. Scan is shorted before detail. Fullscan absorbs whatever the other two leave.
+This means scan and fullscan are sized before detail and keep their capacity; when the seats cannot cover every ideal, detail coverage is reduced first. (An earlier version of this design allocated detail first, then scan, with fullscan absorbing the shortage; the built planner uses the order above.)
 
 ---
 

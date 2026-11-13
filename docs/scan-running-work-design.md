@@ -80,9 +80,11 @@ from the stream, exactly as the scheduler already does (scheduler.py:366, :388):
 2. `xrange(stream, min=id, max=id, count=1)` -> `company`.
 3. durations from `company_load.durations(r, pool, names, fetch_p75)` (fetch_p75 when no entry).
 
-Only entries whose owner is actually running are counted (heartbeat busy_since set for
-that pid); entries of stalled/dead owners are the reaper's.  At most one lookup per worker
-per cycle.
+Only entries whose owner is actually running are counted: the owner's heartbeat key
+(`worker:alive:{type}:{host}:{pid}`) exists, its `worker:cur:{consumer}` report names this
+`msg_id`, and its `alive_until` has not passed (the same RUNNING test as
+`scheduler._owner_state`).  Entries of stalled, abandoned or dead owners are the reaper's.
+Every pending entry is checked (the whole PEL is read, one `xrange` per running entry).
 
 ### Code changes
 
@@ -166,8 +168,8 @@ Failure modes
   returns None -> `_last_work_need` kept (manager.py:1422-1423), same as an unreadable late list.
 * Company missing from the table -> `fetch_p75` default d (as `durations` does); not removed
   from steady.
-* A PEL entry of a stalled/dead owner -> skipped (owner has no live heartbeat with busy_since);
-  the reaper handles it.
+* A PEL entry whose owner is not RUNNING (no heartbeat key, `worker:cur` not naming this
+  message, or `alive_until` passed) -> skipped; the reaper handles it.
 
 Rollback: revert the commit; no schema, no Redis key format and no worker change, so nothing
 to migrate.  Optionally gate behind an env flag (default on) for a quick off switch.
@@ -176,10 +178,10 @@ to migrate.  Optionally gate behind an env flag (default on) for a quick off swi
 
 1. `workers/company_load.py`: add `entries(r, pool, names, default_d)` -> list of (d, T, in_table)
    and `steady_excluding(total, entries)` (subtract `load_of(d,T)` for in-table entries, clamp >= 0).
-2. `workers/manager.py` `_get_running_companies(r, stream_key, group)`: `xpending_range`
-   (bounded count) -> keep entries whose consumer pid has a live heartbeat with `busy_since`
-   (reuse the `worker:alive:{pool}_worker:*` scan used by `_get_pool_busy_ms`, :348-361) ->
-   `xrange` each msg_id -> company names.  Raise on Redis error (caller catches).
+2. `workers/manager.py` `_get_running_companies(r, stream_key, group, now)`: `xpending_range`
+   over the whole PEL -> keep entries whose consumer has a heartbeat key, whose `worker:cur`
+   report names that `msg_id` and whose `alive_until` has not passed -> `xrange` each msg_id
+   -> company names.  Raise on Redis error (caller catches).
 3. `_get_scan_pool_metrics`: add `running_names` (None when unreadable); remove running names
    from `late_names` so a redelivered company counts once.
 4. `_scan_pool_work`: running = `backlog_term(running d, H)`; steady = steady_excluding(...)
@@ -201,6 +203,6 @@ to migrate.  Optionally gate behind an env flag (default on) for a quick off swi
 
 * Actual H (delay_warn_s) of the scan pool at the time: floor 300 s, runtime value not seen.
 * Whether to relax the delay gate for the running term (separate decision; not in this design).
-* How to test owner-state reuse from the manager (heartbeat busy_since by pid vs scheduler._owner_state).
+* The manager re-implements the scheduler's RUNNING test (`_get_running_companies` vs `scheduler._owner_state`); keep the two in step.
 * Extra concurrent scans raise load on the same Workday tenants (11-10 07:20-07:59 429s);
   the ceiling and the DB seat budget still cap it.

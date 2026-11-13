@@ -786,7 +786,7 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
             snap_extra={"adp_dispatched": 10},
             _dispatched_count=lambda r, loop: 14,
             _scan_workers_mid_scan=lambda r: 0)
-        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.OK)
+        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.WARNING)
 
     def test_stall_with_deliberate_halt_is_not_error(self):
         from workers.watchdog import Issue
@@ -849,7 +849,7 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
             snap_extra={"fs_dispatched": 10},
             _dispatched_count=lambda r, loop: 12,
             _deliberate_halt=lambda r, pool: None)
-        self.assertEqual(self._level(issues, "poll:fullscan"), Issue.OK)
+        self.assertEqual(self._level(issues, "poll:fullscan"), Issue.WARNING)
 
     def test_fullscan_stall_dispatched_counter_reset_still_errors(self):
         from workers.watchdog import Issue

@@ -1806,8 +1806,10 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 issues.append(Issue(Issue.OK, "queue:poll:adaptive",
                     f"{summary}  [no restart: {halt}]"))
             elif disp_delta:
-                issues.append(Issue(Issue.OK, "queue:poll:adaptive",
-                    f"{summary}  [no restart: dispatcher handed out +{disp_delta} since last cycle]"))
+                # Stall signals agree but the dispatcher is handing out work: no restart, yet not healthy.
+                issues.append(Issue(Issue.WARNING, "queue:poll:adaptive",
+                    f"{summary}  [no restart: dispatcher handed out +{disp_delta} since last cycle, "
+                    f"but {stall}/{valid} signals say no progress]"))
             elif mid_scan:
                 issues.append(Issue(Issue.WARNING, "queue:poll:adaptive",
                     f"BUSY — {summary}  ({stall}/{valid} signals say no progress, but "
@@ -1875,8 +1877,9 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 issues.append(Issue(Issue.OK, "queue:poll:fullscan",
                     f"{summary}  [no restart: {fs_halt}]"))
             elif fs_disp_delta:
-                issues.append(Issue(Issue.OK, "queue:poll:fullscan",
-                    f"{summary}  [no restart: dispatcher handed out +{fs_disp_delta} since last cycle]"))
+                issues.append(Issue(Issue.WARNING, "queue:poll:fullscan",
+                    f"{summary}  [no restart: dispatcher handed out +{fs_disp_delta} since last cycle, "
+                    f"but {stall}/{valid} signals say no progress]"))
             else:
                 issues.append(Issue(Issue.ERROR, "queue:poll:fullscan",
                     f"STALL — {summary}  ({stall}/{valid} signals agree: no progress since last cycle)",

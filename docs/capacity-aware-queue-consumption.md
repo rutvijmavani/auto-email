@@ -37,7 +37,7 @@ The structural fix described in this document (§3 onwards) solves that. **Only 
 
 ### Correct implementation order
 
-1. **Ship `CeilingExceeded` fix** — `ats_get()` + catch in each worker. Already designed in scaling-redesign.md.
+1. **Ship `CeilingExceeded` fix** — raise `CeilingExceeded` from the live production request path (the shared ceiling check used by the current fetch helpers; `ats_get()` has no production caller, see the Historical note above) and keep the catch in each worker. The intended behaviour is already designed in scaling-redesign.md.
 2. **Observe in production** — does the 500-job pile-up starvation actually manifest?
 3. **If yes, ship structural changes** from §3 of this document.
 

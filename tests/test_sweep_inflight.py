@@ -27,6 +27,9 @@ class _R:
     def zrange(self, key, a, b):
         return list(self.zsets.get(key, []))
 
+    def zscore(self, key, member):
+        return 0.0 if member in self.zsets.get(key, []) else None
+
     def get(self, key):
         return self.kv.get(key)
 
