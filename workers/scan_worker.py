@@ -112,7 +112,7 @@ from workers.redis_client import get_redis, ping
 from workers.heartbeat import BusyMeter, Heartbeat
 from workers.queue_stamp import count_arrival
 from workers import progress
-from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
+from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress, _stream_id_tuple
 from workers.http_client import set_request_context, CeilingExceeded
 from workers.paginator import EarlyExitGate, estimate_scan_depth, make_seen_check
 from jobs.ats_detector import get_ats_module
@@ -206,16 +206,6 @@ def _get_backoff_delay(r, company: str, op_type: str) -> int:
         r.expire(key, 86400)               # first failure → set 24h TTL
 
     return backoff_delay_for(count - 1)   # 0-based retry index
-
-
-def _stream_id_tuple(sid) -> tuple:
-    """'1700000000000-3' -> (1700000000000, 3); (0, 0) when unparseable."""
-    s = sid.decode() if isinstance(sid, bytes) else str(sid)
-    try:
-        ms, _, seq = s.partition("-")
-        return int(ms), int(seq or 0)
-    except ValueError:
-        return 0, 0
 
 
 def _is_superseded(r, company: str, msg_id) -> bool:

@@ -727,10 +727,25 @@ def _is_timestamped(line: str) -> bool:
         return False
 
 
+_EXC_LINE_RE = re.compile(r'^[A-Za-z_][\w.]*(?:Error|Exception|Warning)\b')
+
+
+def _is_traceback_line(line: str) -> bool:
+    """True for lines that belong to a traceback: the header, indented frame/source lines,
+    and the final "SomeError: msg" line.  Unrelated lines that merely follow the error
+    (an INFO line written next) are not."""
+    return (
+        line.startswith(("Traceback (most recent call last):", " ", "\t"))
+        or bool(_EXC_LINE_RE.match(line))
+    )
+
+
 def _seen_key(line: str, context: list[str] | None = None) -> str:
-    """Key of one handled occurrence: the flagged line plus the traceback context that
-    _fingerprint also sees, so two identical lines with different tracebacks stay distinct."""
-    payload = "\n".join([line, *(context or [])])
+    """Key of one handled occurrence: the flagged line plus ONLY its traceback lines, so two
+    identical lines with different tracebacks stay distinct while whatever is logged after
+    the error (lookahead context) cannot change the key."""
+    tb = [c for c in (context or []) if _is_traceback_line(c)]
+    payload = "\n".join([line, *tb])
     return _PFX_SEEN + hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
 

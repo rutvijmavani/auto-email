@@ -304,6 +304,15 @@ def _s(v) -> str:
     return v.decode() if isinstance(v, bytes) else str(v)
 
 
+def _stream_id_tuple(sid) -> tuple:
+    """'1700000000000-3' -> (1700000000000, 3); (0, 0) when unparseable."""
+    try:
+        ms, _, seq = _s(sid).partition("-")
+        return int(ms), int(seq or 0)
+    except ValueError:
+        return 0, 0
+
+
 def _split_consumer(consumer: str):
     """'worker-{host}-{pid}' -> (host, pid); (None, None) for any other consumer."""
     if not consumer.startswith("worker-"):
@@ -403,7 +412,7 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
         # above; it must not requeue, count a reap or release the newer dispatch's slot.  A missing
         # stored id (slot already released) keeps the existing handling.
         stored = r.get(f"{REDIS_INFLIGHT_MSG_PREFIX}:{op_type}:{company}")
-        if stored and _s(stored) != msg_id:
+        if stored and _stream_id_tuple(stored) > _stream_id_tuple(msg_id):
             logger.info("claim_stale_work: %r entry %s (%s) superseded by dispatch %s — acked only",
                         company, msg_id, state, _s(stored))
             continue

@@ -253,6 +253,25 @@ class TestSeenLines(unittest.TestCase):
         again = lm.process_findings(r, self._raw(line), NOW + 100, [])
         self.assertEqual(len(again), 1)
 
+    def test_trailing_info_line_does_not_change_key(self):
+        line = _err("boom")
+        info = "2026-09-20 15:00:01.000 | INFO | a | later unrelated line"
+        tb = ["Traceback (most recent call last):", '  File "x.py", line 3, in f', "ValueError: bad"]
+        self.assertEqual(lm._seen_key(line, tb), lm._seen_key(line, tb + [info]))
+        self.assertEqual(lm._seen_key(line, []), lm._seen_key(line, [info]))
+        self.assertNotEqual(lm._seen_key(line, tb), lm._seen_key(line, tb[:2] + ["KeyError: other"]))
+
+    def test_reread_with_appended_info_line_stays_suppressed(self):
+        r, line = _FakeRedis(), _err("boom")
+        info = "2026-09-20 15:00:01.000 | INFO | a | later unrelated line"
+        seen = []
+        lm.process_findings(r, {"manager.log": [(line.rstrip(), [])]}, NOW, seen)
+        lm.mark_seen(r, seen)
+        r.kv = {k: v for k, v in r.kv.items() if k.startswith(lm._PFX_SEEN)}
+        again = lm.process_findings(r, {"manager.log": [(line.rstrip(), [info])]}, NOW + 100, [])
+        self.assertEqual(again, {})
+        self.assertFalse(any(k.startswith(lm._PFX_ACT) for k in r.kv))   # no heartbeat refresh
+
     def test_untimestamped_line_never_tracked(self):
         r = _FakeRedis()
         raw = {"x.log": [("Traceback (most recent call last):", ["  File x"])]}
