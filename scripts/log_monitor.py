@@ -455,13 +455,20 @@ def _is_traceback_component(line: str) -> bool:
     return bool(_TRACEBACK_COMPONENT_RE.match(line))
 
 
+class InodeChanged(Exception):
+    """The file opened for reading is not the file the caller keyed its offset to."""
+
+
 def scan_file(
-    path: Path, offset: int
+    path: Path, offset: int, expected_inode: int | None = None
 ) -> tuple[int, list[tuple[str, list[str]]]]:
     """
     Read new content in *path* from *offset*.
     Returns (new_offset, [(flagged_line, context_lines), ...]).
     Handles log rotation: if file shrank, resets to 0.
+    When *expected_inode* is given (non-zero), the inode of the OPEN handle (fstat) must
+    match it, else InodeChanged is raised before anything is read — so data from a file
+    swapped in between stat and open is never stored under the old (path, inode) key.
     """
     try:
         size = path.stat().st_size
@@ -480,6 +487,8 @@ def scan_file(
     new_offset = offset
     try:
         with open(path, errors="replace") as fh:
+            if expected_inode and os.fstat(fh.fileno()).st_ino != expected_inode:
+                raise InodeChanged(str(path))
             fh.seek(offset)
             # Each entry: (raw_line, start_pos, end_pos)
             # start_pos is captured before readline() so we can re-position to
@@ -529,6 +538,8 @@ def scan_file(
                     new_offset = end0 if raw0.endswith('\n') else start0
                     buf.pop(0)
                     _fill(0)
+    except InodeChanged:
+        raise
     except Exception:
         return offset, []
 
@@ -611,7 +622,10 @@ def collect_raw_findings(
         else:
             saved_offset = 0               # new file, or live file replaced (new inode)
 
-        new_off, hits = scan_file(path, saved_offset)
+        try:
+            new_off, hits = scan_file(path, saved_offset, inode)
+        except InodeChanged:
+            continue                       # swapped after stat; next cycle re-keys it
         scanned_bytes += max(0, new_off - (saved_offset if saved_offset <= st.st_size else 0))
         new_entries[key] = {"offset": new_off, "scanned_at": now}
         if hits:

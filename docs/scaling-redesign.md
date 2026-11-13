@@ -222,7 +222,8 @@ if needs_urgent_spawn:
         worker_ceil = new_ceil                  # correct stale ceiling immediately
     # Step 2: spawn exactly what the formula says (not always the ceiling)
     spawn_to(min(workers_target, worker_ceil))
-    # Step 3: no dispatch throttle (decided: not built)
+    # Step 3: urgent dispatch = send the worker target (Step 2) and mark urgent state;
+    #         dispatch is not restricted and there is no release event
     scale_up_cycles = 0                         # prevent stale count from triggering add_one
     urgent_active[pool] = True
 
@@ -230,12 +231,11 @@ if needs_urgent_spawn:
 elif urgent_active[pool]:
     # workers are up; recalculate with real observed data
     if workers_target <= n_workers:             # confirmed right-sized or over
-        set_dispatch_throttle(pool, 1.0)        # release immediately — delay drops after
-        urgent_active[pool] = False
+        urgent_active[pool] = False             # clear urgent state; delay drops after
         if workers_target < n_workers - 1:
             scale_down_cycles += 1              # over-provisioned → begin scale-down
     else:                                       # still need more (at ceiling → Layer 2)
-        pass                                    # throttle holds; Layer 2 takes over
+        pass                                    # urgent state holds; Layer 2 takes over
 
 # ── Scale-up (2 consecutive cycles) ───────────────────────────────────────
 elif pool_utilization > 0.80 \
