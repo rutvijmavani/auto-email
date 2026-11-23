@@ -323,7 +323,10 @@ def evaluate(entries: list[dict], state: dict, now: float) -> list[dict]:
                     if i != len(runs) - 1 or run["start"] < lookback:
                         continue
                     _check_in_progress(key, job, run, log, now, alerts)
-                elif run["start"] not in job["recorded_starts"]:
+                elif run["start"] >= hist_cut and run["start"] not in job["recorded_starts"]:
+                    # A run older than the history window is no longer in recorded_starts (pruned above)
+                    # but its log can still be parsed (current month's file); skipping it stops a
+                    # failure from being re-alerted once the window passes.
                     _record_finished(key, job, run, init_at, alerts)
 
     # 4. Crontab shrink
