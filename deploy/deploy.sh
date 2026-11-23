@@ -127,6 +127,7 @@ _pull_err() {
     exit $_exit
 }
 
+_setup_cron_changed=false
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
@@ -150,6 +151,11 @@ if [[ "$BEHIND" == "0" ]]; then
     fi
 else
     git pull origin "${_BRANCH}"
+    # The run_*.sh wrappers are generated from setup_cron.sh and are not in git, so a changed
+    # setup_cron.sh does not reach them on its own (the VM ran a stale run_monthly.sh for a week).
+    if ! git diff --quiet "$PREVIOUS_SHA" HEAD -- setup_cron.sh; then
+        _setup_cron_changed=true
+    fi
     NEW_SHA=$(git rev-parse --short HEAD)
     echo "  Updated to : $NEW_SHA"
     echo ""
@@ -200,9 +206,13 @@ for _w in $_cron_wrappers; do
 done
 if [[ $_crontab_rc -ne 0 ]]; then
     :   # already warned above; deploy continues (self-heal is non-fatal)
-elif [[ -n "$_missing_wrappers" ]]; then
-    echo "  [WARN] Cron wrapper(s) missing or not executable:$_missing_wrappers"
-    echo "  [WARN] Something deleted them — regenerating via setup_cron.sh"
+elif [[ -n "$_missing_wrappers" ]] || $_setup_cron_changed; then
+    if [[ -n "$_missing_wrappers" ]]; then
+        echo "  [WARN] Cron wrapper(s) missing or not executable:$_missing_wrappers"
+        echo "  [WARN] Something deleted them — regenerating via setup_cron.sh"
+    else
+        echo "  setup_cron.sh changed in this deploy — regenerating wrappers"
+    fi
     if bash "$PROJECT_DIR/setup_cron.sh"; then
         echo "  Cron wrappers regenerated."
     else
