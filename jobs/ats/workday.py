@@ -796,6 +796,29 @@ def _parse_additional_location(loc):
     return loc
 
 
+def _job_req_id(job, external_path, job_url):
+    """
+    Requisition id of a listing (design P1). bulletFields[0] is the id on most tenants but not on Motorola
+    (location), Intel ("Spotlight Job") or Wisconsin (no id bullet), where many jobs then share one id.
+    The id is the text after the last "_" of the last externalPath segment. Use the bullet equal to it, or
+    to it minus a trailing "-<digits>" (Intel JR0289044-1 -> JR0289044); else the token itself (Wisconsin).
+    Without a usable path token: bulletFields[0], else a regex on the job URL (legacy behaviour).
+    """
+    bullets = [b for b in (job.get("bulletFields") or []) if isinstance(b, str)]
+    segment = (external_path or "").rstrip("/").rsplit("/", 1)[-1]
+    token = segment.rsplit("_", 1)[-1].strip() if "_" in segment else ""
+    if token:
+        base = re.sub(r"-\d+$", "", token)
+        for cand in (token, base):
+            if cand in bullets:
+                return cand
+        return token
+    if bullets and bullets[0]:
+        return bullets[0]
+    m = re.search(r"_((?:JR|R)-?\d+(?:-\d+)?)", job_url)
+    return m.group(1) if m else ""
+
+
 def _normalize(job, company, domain, path, slug_info=None):
     """
     Normalize Workday job to standard format.
@@ -866,13 +889,7 @@ def _normalize(job, company, domain, path, slug_info=None):
         # so we never silently drop a job with a valid title
         job_url = domain.rstrip("/") + "/" + path.strip("/")
 
-    # bulletFields[0] is the job req ID (e.g. "R-107385") — confirmed across tenants.
-    # Fall back to regex on job_url for safety.
-    import re as _re
-    _bullet_id = (job.get("bulletFields") or [""])[0]
-    if not _bullet_id:
-        _wd_match  = _re.search(r'_((?:JR|R)-?\d+(?:-\d+)?)', job_url)
-        _bullet_id = _wd_match.group(1) if _wd_match else ""
+    _bullet_id = _job_req_id(job, external_path, job_url)
 
     _si = slug_info or {}
     return {
