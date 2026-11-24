@@ -110,7 +110,7 @@ def _make_patterns():
         # Skip locale prefix (en-US, fr-FR, zh-CN, etc.)
         path = next(
             (p for p in parts if not _LOCALE_PATTERN.match(p)),
-            parts[0] if parts else "careers"
+            "careers"   # locale-only path: never use the locale as the site
         )
         return json.dumps({
             "slug": tenant,
@@ -139,7 +139,7 @@ def _make_patterns():
         parts  = [p for p in m.group(3).strip("/").split("/") if p]
         path   = next(
             (p for p in parts if not _LOCALE_PATTERN2.match(p)),
-            parts[0] if parts else "careers"
+            "careers"   # locale-only path: never use the locale as the site
         )
         return json.dumps({
             "slug": tenant,

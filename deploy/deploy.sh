@@ -127,7 +127,7 @@ _pull_err() {
     exit $_exit
 }
 
-_setup_cron_changed=false
+_CRON_PENDING_FLAG="$PROJECT_DIR/data/.cron_regen_pending"
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
@@ -153,10 +153,12 @@ else
     git pull origin "${_BRANCH}"
     # The run_*.sh wrappers are generated from setup_cron.sh and are not in git, so a changed
     # setup_cron.sh does not reach them on its own (the VM ran a stale run_monthly.sh for a week).
+    # Persisted in a flag file so a failed regeneration (or an aborted deploy) is retried by the next deploy,
+    # even when that one pulls nothing; cleared only after setup_cron.sh succeeds.
     if ! git diff --quiet "$PREVIOUS_SHA" HEAD -- setup_cron.sh; then
-        _setup_cron_changed=true
+        mkdir -p "$PROJECT_DIR/data" && touch "$_CRON_PENDING_FLAG"
     fi
-    NEW_SHA=$(git rev-parse --short HEAD)
+    NEW_SHA=$(git rev-parse --short HEAD)   # (flag handling above)
     echo "  Updated to : $NEW_SHA"
     echo ""
     echo "► Recent changes:"
@@ -206,7 +208,7 @@ for _w in $_cron_wrappers; do
 done
 if [[ $_crontab_rc -ne 0 ]]; then
     :   # already warned above; deploy continues (self-heal is non-fatal)
-elif [[ -n "$_missing_wrappers" ]] || $_setup_cron_changed; then
+elif [[ -n "$_missing_wrappers" ]] || [[ -f "$_CRON_PENDING_FLAG" ]]; then
     if [[ -n "$_missing_wrappers" ]]; then
         echo "  [WARN] Cron wrapper(s) missing or not executable:$_missing_wrappers"
         echo "  [WARN] Something deleted them — regenerating via setup_cron.sh"
@@ -214,6 +216,7 @@ elif [[ -n "$_missing_wrappers" ]] || $_setup_cron_changed; then
         echo "  setup_cron.sh changed in this deploy — regenerating wrappers"
     fi
     if bash "$PROJECT_DIR/setup_cron.sh"; then
+        rm -f "$_CRON_PENDING_FLAG"
         echo "  Cron wrappers regenerated."
     else
         echo "  [WARN] setup_cron.sh failed — cron jobs may not run; fix manually"

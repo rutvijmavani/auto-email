@@ -251,6 +251,9 @@ def test_job_key_falls_back_to_external_url():
     k = workday._job_key
     assert k({"externalUrl": "https://x.com/1", "title": "T"}) != k({"externalUrl": "https://x.com/2", "title": "T"})
     assert k({"externalPath": "/job/a", "externalUrl": "https://x.com/1"}) == "/job/a"
+    # a generic (non "/job/") URL shared by postings must not beat the bullet id
+    assert k({"externalUrl": "https://x.com/careers", "bulletFields": ["R-1"]}) == "R-1"
+    assert k({"externalUrl": "https://x.com/job/1", "bulletFields": ["R-1"]}) == "https://x.com/job/1"
 
 
 def test_job_id_rule():

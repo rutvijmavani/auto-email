@@ -284,7 +284,10 @@ def _extract_workday(text):
     ):
         if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:
             continue   # jobs./apply./www. aggregator hosts are not tenants
-        slug = json.dumps({"slug": m.group(1), "wd": m.group(2) or "", "path": m.group(3)})
+        path = m.group(3)
+        if re.fullmatch(r'[a-z]{2}[-_][A-Z]{2}', path):
+            path = "careers"   # locale-only URL (e.g. /en-US/): the locale is not the site
+        slug = json.dumps({"slug": m.group(1), "wd": m.group(2) or "", "path": path})
         return {"platform": "workday", "slug": slug}
     # alternate myworkdaysite.com domain
     m = re.search(

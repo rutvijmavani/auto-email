@@ -242,9 +242,11 @@ def fetch_jobs(slug_info, company, stop_check=None):
 
 def _job_key(posting):
     """Identity of a listing across facet slices: its relative path, else req id, else title+location."""
+    url = posting.get("externalUrl") or ""
     return (posting.get("externalPath")
-            or posting.get("externalUrl")
+            or (url if "/job/" in url else "")      # only a posting-specific URL; a generic one is shared
             or (posting.get("bulletFields") or [""])[0]
+            or url
             or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
 
 
@@ -424,7 +426,7 @@ def _plan_board(url, company, rep, base=None):
                 continue
             cands = _facet_candidates(data.get("facets"), used)
             if size is None:
-                size = _board_size(cands) or total
+                size = max(_board_size(cands) or 0, total)
                 rep["expected"] = size
             best = _choose_facet(cands, size) if depth < WORKDAY_PLAN_MAX_DEPTH else None
             if best is None:
@@ -497,6 +499,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
             continue
         for p in data.get("jobPostings") or []:
             got.setdefault(_job_key(p), p)
+    if stopped:
+        rep.setdefault("early_leaves", []).append(leaf["applied"])
     if not stopped and len(got) != leaf["K"]:
         rep.setdefault("leaf_mismatch", []).append((leaf["applied"], leaf["K"], len(got)))
     return got
@@ -551,7 +555,7 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep):
         term = words.most_common(1)[0][0]
         tried.add(term)
         new, off, ended = {}, 0, False
-        while off < WORKDAY_RESULT_CAP and not ended:
+        while off < WORKDAY_RESULT_CAP and not ended and spent < allowance:
             _budget_add(rep, WORKDAY_SEARCH_CHUNK_PAGES)
             spent += WORKDAY_SEARCH_CHUNK_PAGES
             rows = fresh = 0
@@ -586,13 +590,15 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
     Close gaps between a split node's promised count and the unique jobs its leaves returned, deepest
     node first: within tolerance = done; else a direct window (the node's first WORKDAY_RESULT_CAP jobs,
     only for nodes up to WORKDAY_WINDOW_MAX x the cap); else searchText. A node still short is recorded
-    in rep["partial"] and sets rep["capped"]. Skipped when any leaf exited early (a short leaf is deliberate).
+    in rep["partial"] and sets rep["capped"]. A node is skipped when a leaf inside it exited early
+    (rep["early_leaves"]: a short leaf is deliberate); other nodes are still recovered.
     """
-    if rep.get("early"):
-        return
+    early = rep.get("early_leaves") or []
     try:
         for node in sorted(nodes, key=lambda n: -n["depth"]):
             applied, size = node["applied"], node["K"]
+            if any(all(e.get(a) == b for a, b in applied.items()) for e in early):
+                continue   # a leaf inside this node exited early on purpose: its shortfall is deliberate
             have = len(_node_union(applied, leaf_got))
             tol = max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL * size)
             if size - have <= tol:
