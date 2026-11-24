@@ -273,13 +273,18 @@ def _extract_api_paths(bundle_text):
 # Each takes raw text, returns {"platform": ..., "slug": ...} or None
 # ─────────────────────────────────────────────────────────────────────────────
 
+_WORKDAY_NON_TENANT = frozenset({"jobs", "apply", "www", "community", "wd", "impl", "myworkday"})
+
+
 def _extract_workday(text):
-    m = re.search(
-        r'([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com/([a-zA-Z0-9_%-][a-zA-Z0-9_%-]*)',
+    # wd group optional: bare host {tenant}.myworkdayjobs.com is stored as "wd": "".
+    for m in re.finditer(
+        r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com/([a-zA-Z0-9_%-][a-zA-Z0-9_%-]*)',
         text, re.IGNORECASE,
-    )
-    if m:
-        slug = json.dumps({"slug": m.group(1), "wd": m.group(2), "path": m.group(3)})
+    ):
+        if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:
+            continue   # jobs./apply./www. aggregator hosts are not tenants
+        slug = json.dumps({"slug": m.group(1), "wd": m.group(2) or "", "path": m.group(3)})
         return {"platform": "workday", "slug": slug}
     # alternate myworkdaysite.com domain
     m = re.search(

@@ -516,8 +516,16 @@ def extract_slug(row):
 
     # ── Workday ──────────────────────────────────────────
     if domain == "myworkdayjobs.com":
-        tenant = fourth.lower()
-        wd     = third.lower()
+        # {tenant}.{wdN}.myworkdayjobs.com -> 4th=tenant, 3rd=wdN
+        # {tenant}.myworkdayjobs.com (bare) -> 3rd=tenant, 4th empty, stored as wd ""
+        if re.match(r'^wd[0-9]+$', third, re.IGNORECASE):
+            tenant = fourth.lower()
+            wd     = third.lower()
+        elif not fourth.strip():
+            tenant = third.lower()
+            wd     = ""
+        else:
+            return None  # skip non-WD subdomains
         # Extract path — skip locale prefix (en-US, en-GB, fr-FR etc.)
         # URLs look like: /en-US/CareerSiteName/job/... OR /CareerSiteName/job/...
         # We want the career site name, not the locale
@@ -533,8 +541,6 @@ def extract_slug(row):
 
         if not tenant or tenant in EXCLUDED_SLUGS:
             return None
-        if not re.match(r'^wd[0-9]+$', wd, re.IGNORECASE):
-            return None  # skip non-WD subdomains
         # Validate path_ — reject URL delimiters or scheme patterns
         if (path_ and (
             ":" in path_ or "//" in path_

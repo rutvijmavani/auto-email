@@ -96,7 +96,15 @@ def _make_patterns():
     # We always want the career site name, not the locale prefix.
     _LOCALE_PATTERN = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
 
+    # Hosts that are Workday aggregator / portal / marketing sites, never a tenant. Only matters for
+    # the bare form ({tenant}.myworkdayjobs.com); the wdN form was never ambiguous.
+    _WORKDAY_NON_TENANT = frozenset({"jobs", "apply", "www", "community", "wd", "impl", "myworkday"})
+
     def _workday_slug(m):
+        tenant = m.group(1).lower()
+        wd     = (m.group(2) or "").lower()   # "" = bare host ({tenant}.myworkdayjobs.com)
+        if not wd and tenant in _WORKDAY_NON_TENANT:
+            return None
         raw_path = m.group(3).rstrip("/")
         parts    = [p for p in raw_path.split("/") if p]
         # Skip locale prefix (en-US, fr-FR, zh-CN, etc.)
@@ -105,14 +113,15 @@ def _make_patterns():
             parts[0] if parts else "careers"
         )
         return json.dumps({
-            "slug": m.group(1).lower(),
-            "wd":   m.group(2).lower(),
+            "slug": tenant,
+            "wd":   wd,
             "path": path or "careers",
         })
 
     patterns.append((
         re.compile(
-            r"([a-z0-9]+)\.(wd\d+)\.myworkdayjobs\.com/([^?&#\s]*)",
+            # (?<![a-z0-9.-]) keeps "a.b.myworkdayjobs.com" from reading "b" as a bare tenant.
+            r"(?<![a-z0-9.-])([a-z0-9]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com/([^?&#\s]*)",
             re.IGNORECASE
         ),
         "workday",
