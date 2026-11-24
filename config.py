@@ -128,9 +128,7 @@ FETCH_SERVER_SHORT_MIN_PCT  = float(os.getenv("FETCH_SERVER_SHORT_MIN_PCT", "50"
 # jobs/ats/workday.py — Workday caps each search at WORKDAY_RESULT_CAP results regardless of the real board size
 WORKDAY_PAGE_SIZE           = int(os.getenv("WORKDAY_PAGE_SIZE", "20"))          # Workday rejects larger limits
 WORKDAY_RESULT_CAP          = int(os.getenv("WORKDAY_RESULT_CAP", "2000"))       # observed hard ceiling of `total` (Nvidia, T-Mobile)
-WORKDAY_FACET_SPLIT_AT      = int(os.getenv("WORKDAY_FACET_SPLIT_AT", "1900"))   # total >= this → fetch one query per facet value
-WORKDAY_SPLIT_FACETS        = tuple(os.getenv("WORKDAY_SPLIT_FACETS", "jobFamilyGroup,timeType,workerSubType,locations").split(","))  # tried in order; `locations` = city, nested under locationMainGroup (Accenture)
-# Workday partial-fetch planner (docs/workday-partial-fetch-design.md). Added ahead of the planner; the two settings above are removed with it.
+# Workday partial-fetch planner (docs/workday-partial-fetch-design.md)
 WORKDAY_FACET_SUM_TOL       = float(os.getenv("WORKDAY_FACET_SUM_TOL", "0.02"))    # facet sums within this fraction of each other agree on the board size
 WORKDAY_FACET_FLOOR         = float(os.getenv("WORKDAY_FACET_FLOOR", "0.9"))       # a facet must cover at least this share of its slice
 WORKDAY_FACET_MAXSHARE      = float(os.getenv("WORKDAY_FACET_MAXSHARE", "0.9"))    # prefer facets whose biggest value is at most this share of the slice

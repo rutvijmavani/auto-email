@@ -350,8 +350,11 @@ All env-overridable in `config.py`.
 | `JOBVITE_FEED_TRACE_MAX` | 300 | Max feed-only jobs redirect-traced per check; rest = unresolved |
 | `WORKDAY_PAGE_SIZE` | 20 | Jobs per Workday request |
 | `WORKDAY_RESULT_CAP` | 2000 | Workday's per-query result cap (used in warnings) |
-| `WORKDAY_FACET_SPLIT_AT` | 1900 | Page-1 total at/above which the board is fetched one facet value at a time |
-| `WORKDAY_SPLIT_FACETS` | `jobFamilyGroup,timeType,workerSubType,locations` | Facets tried in order when splitting |
+| `WORKDAY_FACET_SUM_TOL`, `WORKDAY_FACET_FLOOR`, `WORKDAY_FACET_MAXSHARE`, `WORKDAY_GAP_PENALTY`, `WORKDAY_PLAN_MAX_DEPTH` | 0.02, 0.9, 0.9, 20, 5 | Planner: facet sums within this fraction agree on the board size; a facet must cover this share of its slice; prefer facets whose biggest value is at most this share; cost of a missed job in requests; deepest nesting. The planner picks the cheapest facet itself (the old `WORKDAY_FACET_SPLIT_AT` / `WORKDAY_SPLIT_FACETS` are gone) |
+| `WORKDAY_GAP_TOL`, `WORKDAY_GAP_MIN`, `WORKDAY_WINDOW_MAX` | 0.005, 10, 2 | Recovery: node gap tolerated (fraction / jobs); direct first-2000 window only for nodes up to this many x the cap |
+| `WORKDAY_SEARCH_CHUNK_PAGES`, `WORKDAY_SEARCH_MIN_NEW`, `WORKDAY_SEARCH_IDLE_TERMS`, `WORKDAY_SEARCH_TERM_MIN_LEN`, `WORKDAY_SEARCH_STOPWORDS` | 10, 0.05, 3, 4, see `config.py` | Recovery by searchText terms taken from job titles |
+| `WORKDAY_BUDGET_SLACK`, `WORKDAY_BUDGET_PAD` | 0.10, 2 | Hard request budget per slice = planned x (1 + slack) + pad |
+| `WORKDAY_COUNTRY_FILTER_TENANT`, `_FACET`, `_DESCRIPTOR` | accenture, locationCountry, United States of America | Tenant fetched with a country facet only (Accenture US) |
 | `FULLSCAN_PARTIAL_MAX_RETRIES` | 3 | Hourly fullscan retries after a `request_failed` fetch; past this the scan completes with its incomplete verdict recorded |
 | `FULLSCAN_PARTIAL_RETRY_TTL_S` | 86400 | Expiry of the per-company retry counter (Redis key prefix `REDIS_FULLSCAN_PARTIAL_PREFIX`); cleared when a scan completes |
 | `AUDIT_*` | see `config.py` | Thresholds for `scripts/audit_fetch_health.py` (read-only under-fetch audit) |
