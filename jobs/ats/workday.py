@@ -10,7 +10,8 @@ import re
 import statistics
 from datetime import datetime
 from config import (
-    WORKDAY_BUDGET_PAD, WORKDAY_BUDGET_SLACK, WORKDAY_FACET_FLOOR, WORKDAY_FACET_MAXSHARE,
+    WORKDAY_BUDGET_PAD, WORKDAY_COUNTRY_FILTER_DESCRIPTOR, WORKDAY_COUNTRY_FILTER_FACET,
+    WORKDAY_COUNTRY_FILTER_TENANT, WORKDAY_BUDGET_SLACK, WORKDAY_FACET_FLOOR, WORKDAY_FACET_MAXSHARE,
     WORKDAY_FACET_SUM_TOL, WORKDAY_GAP_MIN, WORKDAY_GAP_PENALTY, WORKDAY_GAP_TOL, WORKDAY_PAGE_SIZE,
     WORKDAY_PLAN_MAX_DEPTH, WORKDAY_RESULT_CAP, WORKDAY_SEARCH_CHUNK_PAGES, WORKDAY_SEARCH_IDLE_TERMS,
     WORKDAY_SEARCH_MIN_NEW, WORKDAY_SEARCH_STOPWORDS, WORKDAY_SEARCH_TERM_MIN_LEN,
@@ -18,7 +19,7 @@ from config import (
 )
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
     attach, count_distinct,
 )
 from jobs.utils import clean_html
@@ -138,6 +139,41 @@ def _get_path_variants(slug, company):
     return variants
 
 
+def _country_filter(url, company, rep):
+    """
+    appliedFacets for the one tenant that is read for a single country (Accenture: US only; non-US jobs are
+    deleted after the detail fetch anyway). The value id is looked up on page 1 of the unfiltered query each
+    scan, so a re-keyed id cannot break it. Returns {facet: [id]}, or None when page 1 failed or the value
+    is missing (rep["failed"] / rep["filter_missing"] say which).
+    """
+    data = _page1(url, {}, company, rep)
+    if data is None:
+        rep["failed"] = True
+        logger.warning("workday country filter: page 1 failed for %r", company)
+        return None
+    wanted = WORKDAY_COUNTRY_FILTER_DESCRIPTOR.strip().lower()
+    for f in _flatten_facets(data.get("facets") or []):
+        if f.get("facetParameter") != WORKDAY_COUNTRY_FILTER_FACET:
+            continue
+        for v in f.get("values") or []:
+            if isinstance(v, dict) and v.get("id") and str(v.get("descriptor", "")).strip().lower() == wanted:
+                return {WORKDAY_COUNTRY_FILTER_FACET: [v["id"]]}
+    rep["filter_missing"] = True
+    logger.error("workday country filter: %r has no %r value in facet %s — not fetching the unfiltered board",
+                 company, WORKDAY_COUNTRY_FILTER_DESCRIPTOR, WORKDAY_COUNTRY_FILTER_FACET)
+    return None
+
+
+def _filter_missing_result(rep):
+    """Not-complete report for a scan that could not resolve its country filter (nothing fetched)."""
+    stop = STOP_NO_CONFIG if rep.get("filter_missing") else STOP_REQUEST_FAILED
+    return attach([], FetchReport(
+        stop_reason=stop, pages=rep["pages"], fetched_distinct=0, unusable=0,
+        reported_total=None, total_source=TOTAL_ATS,
+        note=f"country filter {WORKDAY_COUNTRY_FILTER_DESCRIPTOR!r} not resolved",
+    ))
+
+
 def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs for company from Workday.
@@ -159,7 +195,12 @@ def fetch_jobs(slug_info, company, stop_check=None):
     if stop_check is not None:
         def norm(j):
             return _normalize(j, company, domain, path, slug_info) if j.get("title") else None
-    leaves, nodes = _plan_board(url, company, rep)
+    base = {}
+    if slug_info.get("slug") == WORKDAY_COUNTRY_FILTER_TENANT:
+        base = _country_filter(url, company, rep)
+        if base is None:   # filter value missing: never fall back to the unfiltered board
+            return _filter_missing_result(rep)
+    leaves, nodes = _plan_board(url, company, rep, base)
     merged, leaf_got = _fetch_leaves(url, leaves, company, rep, gate=stop_check, norm=norm)
     _recover(url, nodes, merged, leaf_got, company, rep)
     all_jobs = list(merged.values())
