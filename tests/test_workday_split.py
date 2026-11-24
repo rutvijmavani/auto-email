@@ -28,7 +28,11 @@ def _board(groups, cap=2000, facet_extra=None):
             idx = [i for g in applied["jobFamilyGroup"] for i in groups[g]]
         total = min(len(idx), cap)
         off = body["offset"]
-        window = idx[:total][off:off + body["limit"]]
+        if len(idx) > cap and off >= cap:
+            off_eff = 0   # a capped query repeats page 1 for offsets past the cap (PROVEN live)
+        else:
+            off_eff = off
+        window = idx[:total][off_eff:off_eff + body["limit"]]
         return {"total": total if off == 0 else 0, "jobPostings": [_job(i) for i in window],
                 "facets": facets_for(applied) if off == 0 else []}
     return fake
@@ -64,7 +68,7 @@ def test_capped_board_does_not_page_the_unsplit_query():
             unsplit_offsets.append(body["offset"])
         return fake(url, body=body, **kw)
     assert len(_run(counting)) == 2700
-    assert unsplit_offsets == [0]
+    assert unsplit_offsets == [0, 2000]   # page 1, then the one cap probe
 
 
 def test_slice_still_over_threshold_is_split_again_or_warned():
@@ -102,8 +106,9 @@ def _nested_location_board(n_jobs, cities, no_city=()):
             idx = [n_jobs]
         total = min(len(idx), 2000)
         off = body["offset"]
+        off_eff = 0 if (len(idx) > 2000 and off >= 2000) else off   # capped query repeats page 1 past the cap
         return {"total": total if off == 0 else 0,
-                "jobPostings": [_job(i) for i in idx[:total][off:off + body["limit"]]],
+                "jobPostings": [_job(i) for i in idx[:total][off_eff:off_eff + body["limit"]]],
                 "facets": facets_for() if off == 0 else []}
     return fake
 

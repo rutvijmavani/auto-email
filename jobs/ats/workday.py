@@ -4,7 +4,7 @@
 
 import logging
 from datetime import datetime
-from config import FETCH_TOLERANCE_PCT, WORKDAY_FACET_SPLIT_AT, WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP, WORKDAY_SPLIT_FACETS
+from config import FETCH_TOLERANCE_PCT, WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP, WORKDAY_SPLIT_FACETS
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 from jobs.ats.fetch_report import (
     FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
@@ -139,10 +139,11 @@ def fetch_jobs(slug_info, company, stop_check=None):
     path   = slug_info.get("path", "careers")  # e.g. "ATTGeneral"
 
     # Workday caps every query at WORKDAY_RESULT_CAP results (Nvidia reports total=2000 for 2700 jobs;
-    # offsets past the cap repeat the last page). A board at/above WORKDAY_FACET_SPLIT_AT is therefore
-    # fetched as one query per facet value (jobFamilyGroup, then timeType/workerSubType if a slice is
-    # still too large) and the slices are merged by job path.
-    rep      = {"pages": 0, "failed": False, "capped": False, "expected": None}
+    # offsets past the cap repeat the last page). A board whose page-1 total is at/above the cap and that
+    # the cap probe finds capped is fetched as one query per facet value (jobFamilyGroup, then
+    # timeType/workerSubType if a slice is still too large) and merged by job path; an uncapped board
+    # (BofA, Micron, CVS) is paged flat.
+    rep      = {"pages": 0, "failed": False, "capped": False, "expected": None, "capped_board": None}
     norm = None
     if stop_check is not None:
         def norm(j):
@@ -185,6 +186,41 @@ def _job_key(posting):
             or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
 
 
+def _board_is_capped(url, applied, first_jobs, rep, company):
+    """
+    Per-tenant yes/no cap probe (design P2). Called only when page 1 of a query reports a total at/above
+    WORKDAY_RESULT_CAP. Requests the page at offset WORKDAY_RESULT_CAP and compares it with page 1: a
+    capped tenant serves page 1 again (offsets past the cap repeat it), an uncapped one (BofA, Micron,
+    CVS) serves the next real page, or none when the board is exactly cap-sized.
+
+    The answer is per tenant, so it is cached on `rep["capped_board"]` for the whole scan: the first
+    call (the unfiltered board) probes, every later call (a facet slice of that board) reuses it. A
+    failed probe is treated as capped (the facet split is the safe path) and is not cached, so the next
+    query retries it. With no `rep` there is nowhere to cache, so it probes each time.
+    """
+    cached = None if rep is None else rep.get("capped_board")
+    if cached is not None:
+        return cached
+    first_key = _job_key(first_jobs[0]) if first_jobs else None
+    body = {"limit": WORKDAY_PAGE_SIZE, "offset": WORKDAY_RESULT_CAP}
+    if applied:
+        body["appliedFacets"] = applied
+    data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday")
+    if rep is not None:
+        rep["pages"] += 1
+    if not data:
+        logger.warning("workday fetch: cap probe at offset=%d failed for %r — treating board as capped",
+                       WORKDAY_RESULT_CAP, company)
+        return True
+    probe_jobs = data.get("jobPostings") or []
+    capped = bool(probe_jobs) and first_key is not None and _job_key(probe_jobs[0]) == first_key
+    if rep is not None:
+        rep["capped_board"] = capped
+    logger.info("workday fetch: %r cap probe at offset=%d -> %s", company, WORKDAY_RESULT_CAP,
+                "capped" if capped else "uncapped (paged flat)")
+    return capped
+
+
 def _fetch_pages(url, applied, company, defer_large=False, rep=None, gate=None, norm=None):
     """
     Page one query (optionally filtered by appliedFacets) until its reported total is reached.
@@ -193,9 +229,10 @@ def _fetch_pages(url, applied, company, defer_large=False, rep=None, gate=None, 
     total=0 on some tenants). A failed or empty page before the total is reached stops the loop with a
     WARNING instead of looking like a normal end of list.
 
-    defer_large: stop after page 1 when the total is at/above WORKDAY_FACET_SPLIT_AT — the caller splits
-    by facet instead, so paging the capped query would be wasted requests (_collect re-pages it in full
-    only when no facet can split it).
+    defer_large: stop after page 1 when the total is at/above WORKDAY_RESULT_CAP AND the tenant is capped
+    (_board_is_capped) — the caller splits by facet instead, so paging the capped query would be wasted
+    requests (_collect re-pages it in full only when no facet can split it). An uncapped board is paged
+    flat to its real total.
 
     rep: optional dict collecting the completeness facts ("pages" count, "failed" on a failed or
     short-ended page) for the FetchReport built in fetch_jobs.
@@ -235,7 +272,7 @@ def _fetch_pages(url, applied, company, defer_large=False, rep=None, gate=None, 
         offset += len(jobs)
         if offset >= total:
             break
-        if defer_large and total >= WORKDAY_FACET_SPLIT_AT:
+        if defer_large and total >= WORKDAY_RESULT_CAP and _board_is_capped(url, applied, jobs, rep, company):
             break
         # Adaptive scan: a page of only already-seen jobs counts toward the gate's streak. Never on the
         # last page (handled above) or on a deferred large query, so the board end stays STOP_ALL_PAGES.
@@ -289,7 +326,8 @@ def _collect(url, applied, used, first, company, rep=None, slice_count=None, gat
     when it falls more than FETCH_TOLERANCE_PCT short.
     """
     postings, total, facets = first
-    if total < WORKDAY_FACET_SPLIT_AT:
+    # Split only a query that _fetch_pages deferred: total at/above the cap on a tenant the probe found capped.
+    if total < WORKDAY_RESULT_CAP or not (rep or {}).get("capped_board"):
         return postings
     name, values = _pick_split_facet(facets, used)
     if not name:
