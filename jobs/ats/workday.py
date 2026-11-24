@@ -244,8 +244,9 @@ def fetch_jobs(slug_info, company, stop_check=None):
 def _job_key(posting):
     """Identity of a listing across facet slices: its relative path, else req id, else title+location."""
     url = posting.get("externalUrl") or ""
+    bare = url.split("#", 1)[0].split("?", 1)[0]    # tracking query/fragment must not make one posting two keys
     return (posting.get("externalPath")
-            or (url if "/job/" in url else "")      # only a posting-specific URL; a generic one is shared
+            or (bare if "/job/" in bare else "")    # only a posting-specific URL; a generic one is shared
             or (posting.get("bulletFields") or [""])[0]
             or url
             or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
@@ -493,7 +494,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                     logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
                                    off, company, leaf["applied"])
                     continue
-            if take(jobs, i == len(offs) - 1):
+            # a page still short after the retry keeps its rows but is not shown to the gate
+            if take(jobs, i == len(offs) - 1 or len(jobs) < expect):
                 stopped = True
                 break
     if stopped:

@@ -19,6 +19,13 @@ set -euo pipefail
 DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$DEPLOY_DIR")"
 
+# ── Sanity: must NOT be root (checked before any file is created, so root leaves no root-owned artifacts) ──
+if [[ $EUID -eq 0 ]]; then
+    echo "[ERROR] Do NOT run deploy.sh as root / sudo."
+    echo "        Run as the service user (opc): bash deploy/deploy.sh"
+    exit 1
+fi
+
 # One deploy at a time: concurrent runs would race on the pull, setup_cron.sh, the wrapper
 # regeneration and the data/.cron_regen_pending flag. The lock is held until this shell exits.
 mkdir -p "$PROJECT_DIR/data"
@@ -43,13 +50,6 @@ echo "  Mail Pipeline — code deployment"
 echo "  Project : $PROJECT_DIR"
 echo "  Time    : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "════════════════════════════════════════════════════════════"
-
-# ── Sanity: must NOT be root ──────────────────────────────────────────────────
-if [[ $EUID -eq 0 ]]; then
-    echo "[ERROR] Do NOT run deploy.sh as root / sudo."
-    echo "        Run as the service user (opc): bash deploy/deploy.sh"
-    exit 1
-fi
 
 # ── Pull latest code ──────────────────────────────────────────────────────────
 echo ""
