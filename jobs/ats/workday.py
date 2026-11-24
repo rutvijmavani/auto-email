@@ -20,12 +20,12 @@ WD_VARIANTS = [
     "wd6", "wd7", "wd8", "wd10", "wd12",
 ]
 
-BASE_URL      = "https://{slug}.{wd}.myworkdayjobs.com/wday/cxs/{slug}/{path}/jobs"
-BASE_URL_SITE = "https://{wd}.myworkdaysite.com/wday/cxs/{slug}/{path}/jobs"
-
-# Base domain — used to construct full job URLs
+# Base domain — used to construct full job URLs. A bare host ("wd": "") has no data-center label,
+# e.g. https://nxp.myworkdayjobs.com (see workday_domain()).
 BASE_DOMAIN      = "https://{slug}.{wd}.myworkdayjobs.com"
+BASE_DOMAIN_BARE = "https://{slug}.myworkdayjobs.com"
 BASE_DOMAIN_SITE = "https://{wd}.myworkdaysite.com"
+API_PATH         = "/wday/cxs/{slug}/{path}/jobs"
 
 WD_PATH_VARIANTS = [
     "careers",
@@ -45,23 +45,41 @@ WORKDAY_HEADERS = {
 }
 
 
+def wd_present(wd, site=None):
+    """
+    True when a stored `wd` / `_wd` value is usable (design: presence check, 2026-11-23).
+
+    The key must exist (None = missing = error) but the value may be the empty string, which means
+    the bare host {slug}.myworkdayjobs.com (NXP). `myworkdaysite` tenants build the host FROM wd, so
+    an empty value is never valid for them. Every guard that used a truthiness test on wd/_wd uses this.
+    """
+    if wd is None:
+        return False
+    if wd == "" and site == "myworkdaysite":
+        return False
+    return True
+
+
+def workday_domain(slug, wd, site=None):
+    """Base domain (no trailing slash) for a Workday tenant; the one place the host is formatted."""
+    if site == "myworkdaysite":
+        return BASE_DOMAIN_SITE.format(wd=wd)
+    if wd == "":
+        return BASE_DOMAIN_BARE.format(slug=slug)
+    return BASE_DOMAIN.format(slug=slug, wd=wd)
+
+
 def _build_url(slug_info):
     """Build correct API URL based on which Workday domain is used."""
     slug = slug_info["slug"]
     wd   = slug_info["wd"]
     path = slug_info.get("path", "careers")
-    if slug_info.get("site") == "myworkdaysite":
-        return BASE_URL_SITE.format(slug=slug, wd=wd, path=path)
-    return BASE_URL.format(slug=slug, wd=wd, path=path)
+    return workday_domain(slug, wd, slug_info.get("site")) + API_PATH.format(slug=slug, path=path)
 
 
 def _build_domain(slug_info):
     """Build base domain for constructing full job URLs."""
-    slug = slug_info["slug"]
-    wd   = slug_info["wd"]
-    if slug_info.get("site") == "myworkdaysite":
-        return BASE_DOMAIN_SITE.format(wd=wd)
-    return BASE_DOMAIN.format(slug=slug, wd=wd)
+    return workday_domain(slug_info["slug"], slug_info["wd"], slug_info.get("site"))
 
 
 def detect(company):
@@ -333,25 +351,16 @@ def fetch_job_detail(job):
         Updated job dict with description filled.
     """
     slug          = job.get("_slug", "")
-    wd            = job.get("_wd", "")
+    wd            = job.get("_wd")          # None = missing; "" = bare host (valid)
     path          = job.get("_path", "")
     external_path = job.get("_external_path", "")
     site          = job.get("_site")
 
-    if not all([slug, wd, path, external_path]):
+    if not all([slug, path, external_path]) or not wd_present(wd, site):
         return job
 
     # Build URL based on which Workday domain variant is used
-    if site == "myworkdaysite":
-        url = (
-            f"https://{wd}.myworkdaysite.com"
-            f"/wday/cxs/{slug}/{path}{external_path}"
-        )
-    else:
-        url = (
-            f"https://{slug}.{wd}.myworkdayjobs.com"
-            f"/wday/cxs/{slug}/{path}{external_path}"
-        )
+    url = f"{workday_domain(slug, wd, site)}/wday/cxs/{slug}/{path}{external_path}"
 
     data = fetch_json(url, platform="workday", headers=WORKDAY_HEADERS)
     if not data:
@@ -596,7 +605,7 @@ def _normalize(job, company, domain, path, slug_info=None):
         # Detail-fetch fields — used by fetch_job_detail(), not stored in DB
         "_external_path": external_path,
         "_slug":          _si.get("slug", ""),
-        "_wd":            _si.get("wd", ""),
+        "_wd":            _si.get("wd"),   # "" = bare host (valid); None = key missing
         "_path":          path,
         "_site":          _si.get("site"),
     }

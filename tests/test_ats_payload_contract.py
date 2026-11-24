@@ -258,8 +258,8 @@ class TestGuardClauseSilentFailure(unittest.TestCase):
                       "_slug='' should cause guard to fire; returned a different object")
 
     def test_workday_guard_fires_missing_wd(self):
-        """_wd missing (falsy) → guard fires."""
-        job = {"_slug": "acme", "_wd": "", "_path": "careers",
+        """_wd key missing → guard fires (an empty string is the bare host and is valid)."""
+        job = {"_slug": "acme", "_path": "careers",
                "_external_path": "/job/Austin/Test_R-123"}
         result = workday.fetch_job_detail(job)
         self.assertIs(result, job)
