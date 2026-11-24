@@ -10,10 +10,10 @@ import re
 import statistics
 from datetime import datetime
 from config import (
-    FETCH_TOLERANCE_PCT, WORKDAY_BUDGET_PAD, WORKDAY_BUDGET_SLACK, WORKDAY_FACET_FLOOR, WORKDAY_FACET_MAXSHARE,
+    WORKDAY_BUDGET_PAD, WORKDAY_BUDGET_SLACK, WORKDAY_FACET_FLOOR, WORKDAY_FACET_MAXSHARE,
     WORKDAY_FACET_SUM_TOL, WORKDAY_GAP_MIN, WORKDAY_GAP_PENALTY, WORKDAY_GAP_TOL, WORKDAY_PAGE_SIZE,
     WORKDAY_PLAN_MAX_DEPTH, WORKDAY_RESULT_CAP, WORKDAY_SEARCH_CHUNK_PAGES, WORKDAY_SEARCH_IDLE_TERMS,
-    WORKDAY_SEARCH_MIN_NEW, WORKDAY_SEARCH_STOPWORDS, WORKDAY_SEARCH_TERM_MIN_LEN, WORKDAY_SPLIT_FACETS,
+    WORKDAY_SEARCH_MIN_NEW, WORKDAY_SEARCH_STOPWORDS, WORKDAY_SEARCH_TERM_MIN_LEN,
     WORKDAY_WINDOW_MAX,
 )
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
@@ -141,7 +141,7 @@ def _get_path_variants(slug, company):
 def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs for company from Workday.
-    Handles pagination. stop_check: adaptive-scan EarlyExitGate (fresh gate per facet slice).
+    Plans, pages and recovers (see _plan_board). stop_check: adaptive-scan EarlyExitGate (fresh gate per leaf).
     Returns list of normalized job dicts.
     slug_info = {"slug": "att", "wd": "wd1", "path": "ATTGeneral"}
     """
@@ -149,18 +149,20 @@ def fetch_jobs(slug_info, company, stop_check=None):
     domain = _build_domain(slug_info)
     path   = slug_info.get("path", "careers")  # e.g. "ATTGeneral"
 
-    # Workday caps every query at WORKDAY_RESULT_CAP results (Nvidia reports total=2000 for 2700 jobs;
-    # offsets past the cap repeat the last page). A board whose page-1 total is at/above the cap and that
-    # the cap probe finds capped is fetched as one query per facet value (jobFamilyGroup, then
-    # timeType/workerSubType if a slice is still too large) and merged by job path; an uncapped board
-    # (BofA, Micron, CVS) is paged flat.
-    rep      = {"pages": 0, "failed": False, "capped": False, "expected": None, "capped_board": None}
+    # Workday caps some tenants' queries at WORKDAY_RESULT_CAP results (Nvidia reports total=2000 for 2700 jobs;
+    # offsets past the cap repeat page 1). The planner (see _plan_board) probes the tenant once, splits a
+    # capped board into leaves below the cap, pages them one after another (early-exit gate per leaf),
+    # then closes gaps between promised and fetched counts (_recover). An uncapped board (BofA, Micron,
+    # CVS) is a single leaf paged flat.
+    rep = {"pages": 0, "failed": False, "capped": False, "expected": None, "capped_board": None}
     norm = None
     if stop_check is not None:
         def norm(j):
             return _normalize(j, company, domain, path, slug_info) if j.get("title") else None
-    first    = _fetch_pages(url, {}, company, defer_large=True, rep=rep, gate=stop_check, norm=norm)
-    all_jobs = _collect(url, {}, (), first, company, rep, first[1] or None, gate=stop_check, norm=norm)
+    leaves, nodes = _plan_board(url, company, rep)
+    merged, leaf_got = _fetch_leaves(url, leaves, company, rep, gate=stop_check, norm=norm)
+    _recover(url, nodes, merged, leaf_got, company, rep)
+    all_jobs = list(merged.values())
 
     results = []
     for j in all_jobs:
@@ -179,14 +181,21 @@ def fetch_jobs(slug_info, company, stop_check=None):
     else:
         stop = STOP_ALL_PAGES
     split = rep["expected"] is not None
+    notes = ["split by facet"] if split else []
+    if rep.get("partial"):
+        notes.append("nodes still short: " + "; ".join(f"{n} of {k}" for _a, k, n in rep["partial"]))
+    if rep.get("leaf_mismatch"):
+        notes.append(f"{len(rep['leaf_mismatch'])} leaves off their promised count")
+    if rep.get("over_budget"):
+        notes.append("request budget used up")
     return attach(results, FetchReport(
         stop_reason      = stop,
         pages            = rep["pages"],
         fetched_distinct = count_distinct(results),
         unusable         = len(all_jobs) - len(results),
-        reported_total   = rep["expected"] if split else first[1],
+        reported_total   = rep["expected"] if split else rep.get("reported", 0),
         total_source     = TOTAL_FACET_SUM if split else TOTAL_ATS,
-        note             = "split by facet" if split else "",
+        note             = "; ".join(notes),
     ))
 
 
@@ -232,68 +241,6 @@ def _board_is_capped(url, applied, first_jobs, rep, company):
     return capped
 
 
-def _fetch_pages(url, applied, company, defer_large=False, rep=None, gate=None, norm=None):
-    """
-    Page one query (optionally filtered by appliedFacets) until its reported total is reached.
-
-    Returns (postings, total, facets). `total` and `facets` come from page 1 only (later pages report
-    total=0 on some tenants). A failed or empty page before the total is reached stops the loop with a
-    WARNING instead of looking like a normal end of list.
-
-    defer_large: stop after page 1 when the total is at/above WORKDAY_RESULT_CAP AND the tenant is capped
-    (_board_is_capped) — the caller splits by facet instead, so paging the capped query would be wasted
-    requests (_collect re-pages it in full only when no facet can split it). An uncapped board is paged
-    flat to its real total.
-
-    rep: optional dict collecting the completeness facts ("pages" count, "failed" on a failed or
-    short-ended page) for the FetchReport built in fetch_jobs.
-
-    gate / norm: adaptive-scan EarlyExitGate and the raw->normalized job function; the gate sees each
-    non-final page's normalized jobs and True ends this query ("early" is set on rep).
-    """
-    postings, offset, total, facets = [], 0, None, []
-    while True:
-        body = {"limit": WORKDAY_PAGE_SIZE, "offset": offset}
-        if applied:
-            body["appliedFacets"] = applied
-        data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS,
-                               platform="workday")  # tracked for api_health
-        if rep is not None:
-            rep["pages"] += 1
-        if not data:
-            if rep is not None:
-                rep["failed"] = True
-            # S0: log page 1 too — a failed first page is "0 fetched", not an empty board.
-            logger.warning("workday fetch: request failed at offset=%d (total=%s) for %r applied=%s "
-                           "— %s", offset, total, company, applied,
-                           "partial result" if (offset or total) else "no data")
-            break
-        jobs = data.get("jobPostings", [])
-        if total is None:
-            total  = data.get("total", 0)
-            facets = data.get("facets") or []
-        if not jobs:
-            if total and offset < total:
-                if rep is not None:
-                    rep["failed"] = True
-                logger.warning("workday fetch: empty page at offset=%d of total=%d for %r applied=%s "
-                               "— partial result", offset, total, company, applied)
-            break
-        postings.extend(jobs)
-        offset += len(jobs)
-        if offset >= total:
-            break
-        if defer_large and total >= WORKDAY_RESULT_CAP and _board_is_capped(url, applied, jobs, rep, company):
-            break
-        # Adaptive scan: a page of only already-seen jobs counts toward the gate's streak. Never on the
-        # last page (handled above) or on a deferred large query, so the board end stays STOP_ALL_PAGES.
-        if gate is not None and norm is not None and gate([j for j in map(norm, jobs) if j]):
-            if rep is not None:
-                rep["early"] = True
-            break
-    return postings, total or 0, facets
-
-
 def _flatten_facets(facets):
     """
     Expand grouped facets. Some tenants (Accenture's `locationMainGroup`) hold no values of their own: they
@@ -311,80 +258,10 @@ def _flatten_facets(facets):
     return out
 
 
-def _pick_split_facet(facets, used):
-    """First configured split facet not yet applied that offers 2+ non-empty values; else (None, [])."""
-    by_name = {f.get("facetParameter"): f for f in _flatten_facets(facets)}
-    for name in WORKDAY_SPLIT_FACETS:
-        if name in used or name not in by_name:
-            continue
-        values = [v for v in by_name[name].get("values") or [] if v.get("id") and v.get("count", 0) > 0]
-        if len(values) >= 2:
-            return name, values
-    return None, []
-
-
-def _collect(url, applied, used, first, company, rep=None, slice_count=None, gate=None, norm=None):
-    """
-    Return every posting reachable for `applied`: the plain paged result when it is under the split
-    threshold, otherwise the union (deduped by _job_key) of one query per facet value, recursing with
-    another facet when a slice is still at the threshold.
-
-    rep (see _fetch_pages) also receives "capped" when a slice cannot be split below the result cap, and
-    "expected" — the top-level facet-count sum — when the board was split.
-
-    slice_count: the parent facet's own count for this slice. A further split can lose jobs that carry no
-    value for the new facet (e.g. a city), so the merged result is checked against it and flagged capped
-    when it falls more than FETCH_TOLERANCE_PCT short.
-    """
-    postings, total, facets = first
-    # Split only a query that _fetch_pages deferred: total at/above the cap on a tenant the probe found capped.
-    if total < WORKDAY_RESULT_CAP or not (rep or {}).get("capped_board"):
-        return postings
-    name, values = _pick_split_facet(facets, used)
-    if not name:
-        logger.warning("workday fetch: %r reports %d jobs (cap %d) and cannot be split further "
-                       "(applied=%s) — result is incomplete", company, total, WORKDAY_RESULT_CAP, applied)
-        if rep is not None and total >= WORKDAY_RESULT_CAP:
-            rep["capped"] = True
-        return _fetch_pages(url, applied, company, rep=rep)[0]   # first was deferred after page 1: page it in full
-    merged = {}
-    for value in values:
-        slice_applied = {**applied, name: [value["id"]]}
-        # Each facet slice is its own list with its own order: it gets a fresh gate (streak 0).
-        slice_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
-        for p in _collect(url, slice_applied, used + (name,),
-                          _fetch_pages(url, slice_applied, company, defer_large=True, rep=rep,
-                                       gate=slice_gate, norm=norm),
-                          company, rep, value.get("count"), gate=slice_gate, norm=norm):
-            merged.setdefault(_job_key(p), p)
-    early = bool(rep and rep.get("early"))
-    if slice_count and not early and len(merged) < slice_count * (1 - FETCH_TOLERANCE_PCT / 100):
-        # WW: a nested split routinely misses jobs lacking the new facet (e.g. a city); that is
-        # expected, and the board-level result is still flagged capped below. WARNING only at top level.
-        (logger.info if used else logger.warning)(
-            "workday fetch: %r slice %s reports %d jobs but split by %s fetched %d distinct "
-            "— some jobs carry no %s value", company, applied, slice_count, name, len(merged), name)
-        if rep is not None:
-            rep["capped"] = True
-    expected = sum(v.get("count", 0) for v in values)
-    if rep is not None and not used:
-        rep["expected"] = expected
-    if early:
-        logger.info("workday fetch: %r split by %s early exit, %d distinct jobs read", company, name, len(merged))
-    elif len(merged) < expected:
-        (logger.info if used else logger.warning)(   # WW: nested shortfall is covered by the slice check above
-            "workday fetch: %r split by %s fetched %d distinct of %d expected (applied=%s)",
-            company, name, len(merged), expected, applied)
-    else:
-        logger.info("workday fetch: %r split by %s into %d slices, %d distinct jobs",
-                    company, name, len(values), len(merged))
-    return list(merged.values())
-
-
 # ── Planner (design P3, step 9) ─────────────────────────────────────────────────────────────────────
 # A capped board is split by the facet with the lowest request cost into leaves (each below the cap),
 # the leaves are paged one after another, and every request counts against a hard budget. Not wired
-# into fetch_jobs yet (step 11 swaps it in for _collect).
+# fetch_jobs runs it: plan -> fetch leaves -> recover.
 
 class _OverBudget(Exception):
     """The scan used its request budget: planned requests x (1 + slack) + a pad per slice."""
