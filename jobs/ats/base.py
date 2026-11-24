@@ -164,6 +164,21 @@ def fetch_json_post(url, body=None, retries=2,
             elapsed_ms  = int(time.time() * 1000) - start_ms
 
             if status_code == 429:
+                # A Cloudflare challenge (cf-mitigated header) is not a rate
+                # limit: waiting 60 s and retrying the same request never
+                # clears it. Record it once (backoff 0, no sleep happened),
+                # run the alert check and give up at once so the caller marks
+                # the fetch incomplete. Only a real string value counts.
+                cf_header = resp.headers.get("cf-mitigated")
+                if isinstance(cf_header, str) and cf_header:
+                    if platform and track:
+                        _record(platform, 429, elapsed_ms, backoff_s=0)
+                        _check_rate_limit_alert(platform)
+                    logger.warning(
+                        "Cloudflare challenge (cf-mitigated=%s) on %s (POST) — not retrying",
+                        cf_header, platform or url
+                    )
+                    return None
                 # Same single-record rule as fetch_json; Workday (the main
                 # caller) previously recorded no backoff and never ran the
                 # rate-limit alert check.
