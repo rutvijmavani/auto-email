@@ -34,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from workers.redis_client import get_redis
+from jobs.ats.registry import detail_key_present
 from config import (
     REDIS_DETAIL_ADAPTIVE,
     REDIS_DETAIL_FULLSCAN,
@@ -52,7 +53,8 @@ def _is_stale_workday(raw: str) -> bool:
         return False
     if job.get("ats_platform") != "workday":
         return False
-    return any(not job.get(k) for k in _WORKDAY_REQUIRED)
+    # "_wd" may be "" (bare host, nxp.myworkdayjobs.com): only a missing key is stale.
+    return any(not detail_key_present("workday", k, job) for k in _WORKDAY_REQUIRED)
 
 
 # Lua script: atomically filter a LIST key.
@@ -67,7 +69,8 @@ for _, item in ipairs(items) do
     local stale = false
     if ok and type(parsed) == 'table' and parsed['ats_platform'] == 'workday' then
         if not parsed['_slug'] or parsed['_slug'] == ''
-        or not parsed['_wd']   or parsed['_wd']   == ''
+        or parsed['_wd'] == nil or parsed['_wd'] == cjson.null
+        or (parsed['_wd'] == '' and parsed['_site'] == 'myworkdaysite')
         or not parsed['_path'] or parsed['_path'] == '' then
             stale = true
         end

@@ -116,7 +116,7 @@ from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress, _str
 from workers.http_client import set_request_context, CeilingExceeded
 from workers.paginator import EarlyExitGate, estimate_scan_depth, make_seen_check
 from jobs.ats_detector import get_ats_module
-from jobs.ats.registry import accepts_stop_check, get_config, parse_slug, should_fetch_detail
+from jobs.ats.registry import accepts_stop_check, detail_key_present, get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
 from jobs.ats.fetch_report import STOP_EARLY_EXIT, STOP_REQUEST_FAILED, report_of
 from jobs.job_filter import filter_jobs, filter_jobs_title_only, passes_listing_date
@@ -733,7 +733,8 @@ def _build_detail_payload(
         # absent.  fetch_job_detail() guard clauses use `not all([...])` which
         # treats empty strings as missing — forwarding "" would silently trigger
         # the guard and return the job unenriched.
-        if job.get(key):
+        # Workday `_wd` is the exception: "" is the bare host and must be forwarded.
+        if detail_key_present(platform, key, job):
             payload[key] = job[key]
 
     # Country code available at listing level (Workday, SmartRecruiters, etc.)
@@ -751,7 +752,8 @@ def _build_detail_payload(
         "icims":           ["_base_url"],
         "jobvite":         ["_slug"],
     }
-    _missing_required = [k for k in _REQUIRED.get(platform, []) if not payload.get(k)]
+    _missing_required = [k for k in _REQUIRED.get(platform, [])
+                         if not detail_key_present(platform, k, payload)]
     if _missing_required:
         raise ValueError(
             f"detail payload missing required keys for {company!r}/{platform} "

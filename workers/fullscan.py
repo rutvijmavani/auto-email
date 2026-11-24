@@ -139,7 +139,7 @@ from workers.scheduler import (
 )
 from workers.paginator import estimate_scan_depth
 from jobs.ats_detector import get_ats_module
-from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
+from jobs.ats.registry import detail_key_present, get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
 from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_REQUEST_FAILED, FetchReport, report_of
 from db.scan_health import SOURCE_FULLSCAN, annotate_latest, record_scan
@@ -781,7 +781,8 @@ def _build_detail_payload(
         # Truthiness, same as scan_worker._build_detail_payload (BDP): an empty
         # string is "absent" for the fetch_job_detail guards (`not all([...])`),
         # so both tiers must drop it the same way.
-        if job.get(key):
+        # Workday `_wd` is the exception: "" is the bare host and must be forwarded.
+        if detail_key_present(platform, key, job):
             payload[key] = job[key]
 
     if job.get("_country_code"):
@@ -797,7 +798,8 @@ def _build_detail_payload(
         "icims":           ["_base_url"],
         "jobvite":         ["_slug"],
     }
-    _missing_required = [k for k in _REQUIRED.get(platform, []) if not payload.get(k)]
+    _missing_required = [k for k in _REQUIRED.get(platform, [])
+                         if not detail_key_present(platform, k, payload)]
     if _missing_required:
         raise ValueError(
             f"detail payload missing required keys for {company!r}/{platform} "

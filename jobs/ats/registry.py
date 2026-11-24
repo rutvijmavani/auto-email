@@ -415,6 +415,19 @@ def parse_slug(platform: str, slug: str, config: dict):
         return defaults.get(platform, {})
 
 
+def detail_key_present(platform: str, key: str, job: dict) -> bool:
+    """
+    True when `key` of a detail payload / job dict counts as present.
+
+    Truthiness for every key except Workday `_wd`, where "" is the bare host ({slug}.myworkdayjobs.com)
+    and only a missing key is an error (workday.wd_present). One predicate so scan_worker,
+    fullscan, detail_worker and should_fetch_detail cannot drift apart.
+    """
+    if platform == "workday" and key == "_wd":
+        return workday.wd_present(job.get("_wd"), job.get("_site"))
+    return bool(job.get(key))
+
+
 def should_fetch_detail(job: dict, platform: str, config: dict,
                          slug_info=None) -> bool:
     """
@@ -446,7 +459,7 @@ def should_fetch_detail(job: dict, platform: str, config: dict,
         return bool(
             job.get("_external_path")
             and job.get("_slug")
-            and job.get("_wd")
+            and detail_key_present("workday", "_wd", job)
             and job.get("_path")
         )
 
