@@ -221,11 +221,15 @@ WHERE crawl  = '{crawl}'
     )
 
     -- Workday: {{slug}}.{{wd}}.myworkdayjobs.com/{{path}}
+    --          and the bare host {{slug}}.myworkdayjobs.com (4th part NULL;
+    --          vendor hosts are dropped later by extract_slug)
     OR (
         url_host_registered_domain = 'myworkdayjobs.com'
-        AND url_host_4th_last_part IS NOT NULL
-        AND url_host_4th_last_part NOT IN (
-            'jobs', 'apply', 'www', 'careers', 'secure'
+        AND (
+            url_host_4th_last_part IS NULL
+            OR url_host_4th_last_part NOT IN (
+                'jobs', 'apply', 'www', 'careers', 'secure'
+            )
         )
     )
 
@@ -547,7 +551,6 @@ def extract_slug(row):
         # Validate path_ — reject URL delimiters or scheme patterns
         if (path_ and (
             ":" in path_ or "//" in path_
-            or len(path_) <= 3
             or not re.match(r'^[a-zA-Z0-9_-]+$', path_)
         )):
             path_ = ""  # store empty rather than invalid value

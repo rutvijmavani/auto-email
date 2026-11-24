@@ -228,6 +228,7 @@ def test_request_budget_is_a_hard_stop():
     with patch.object(workday, "WORKDAY_BUDGET_SLACK", -0.9), patch.object(workday.logger, "warning"):
         jobs = _run(board)
     assert jobs.report.complete is False and len(board.calls) < 125
+    assert len(jobs) > 0          # rows fetched before the stop are kept
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

@@ -152,7 +152,8 @@ echo "  Commits behind : $BEHIND"
 
 if [[ "$BEHIND" == "0" ]]; then
     echo "  Already up to date — skipping pull."
-    if $NO_RESTART; then
+    # a pending cron regeneration (flag file) must still run below, even with nothing to pull
+    if $NO_RESTART && [[ ! -f "$_CRON_PENDING_FLAG" ]]; then
         echo ""
         echo "════════════════════════════════════════════════════════════"
         echo "  Nothing to do."

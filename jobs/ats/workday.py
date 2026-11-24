@@ -222,7 +222,7 @@ def fetch_jobs(slug_info, company, stop_check=None):
         stop = STOP_EARLY_EXIT
     else:
         stop = STOP_ALL_PAGES
-    split = rep["expected"] is not None
+    split = bool(nodes)   # a board no facet could split is reported by its root total
     notes = ["split by facet"] if split else []
     if rep.get("partial"):
         notes.append("nodes still short: " + "; ".join(f"{n} of {k}" for _a, k, n in rep["partial"]))
@@ -279,7 +279,9 @@ def _board_is_capped(url, applied, first_jobs, rep, company):
                        WORKDAY_RESULT_CAP, company)
         return True
     probe_jobs = data.get("jobPostings") or []
-    capped = bool(probe_jobs) and bool(first_keys & {_job_key(p) for p in probe_jobs})   # any repeat of page 1 = capped
+    # capped = the probe page repeats page 1 (at least half of it); one shared key is not a repeat
+    capped = bool(probe_jobs) and bool(first_keys) \
+        and 2 * len(first_keys & {_job_key(p) for p in probe_jobs}) >= len(first_keys)
     if rep is not None:
         rep["capped_board"] = capped
     logger.info("workday fetch: %r cap probe at offset=%d -> %s", company, WORKDAY_RESULT_CAP,
@@ -476,9 +478,13 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         return False
 
     offs = leaf["offs"]
-    stopped = bool(leaf["first"]) and take(leaf["first"], final=not offs)
-    if not stopped:
+    first = leaf["first"]
+    # a cached page 1 shorter than it should be is not shown to the gate
+    stopped = bool(first) and take(first, final=(not offs) or len(first) < min(WORKDAY_PAGE_SIZE, leaf["K"]))
+    try:
         for i, off in enumerate(offs):
+            if stopped:
+                break
             expect = min(WORKDAY_PAGE_SIZE, leaf["K"] - off)   # the last page is legitimately short
             data = _post(url, leaf["applied"], off, company, rep)
             jobs = list(data.get("jobPostings") or []) if data else []
@@ -498,6 +504,9 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
             if take(jobs, i == len(offs) - 1 or len(jobs) < expect):
                 stopped = True
                 break
+    except _OverBudget as e:
+        e.got = got          # rows already fetched survive the hard stop
+        raise
     if stopped:
         rep.setdefault("early_leaves", []).append(leaf["applied"])
     if not stopped and len(got) != leaf["K"]:
@@ -516,6 +525,11 @@ def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
             leaf_got.append((leaf["applied"], set(got)))
     except _OverBudget as e:
         rep["failed"] = True
+        partial = getattr(e, "got", None) or {}
+        for k, p in partial.items():
+            merged.setdefault(k, p)
+        if partial:
+            leaf_got.append((leaf["applied"], set(partial)))
         logger.warning("workday fetch: request budget used up (%s) — partial result", e)
     return merged, leaf_got
 
@@ -591,7 +605,8 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep):
                 break
         have |= set(new)
         for k, p in new.items():
-            merged[k] = p
+            if k not in merged or (p.get("title") and not merged[k].get("title")):
+                merged[k] = p   # a titleless hit never replaces a titled row
         if new:
             leaf_got.append((dict(applied), set(new)))
         idle = 0 if new else idle + 1

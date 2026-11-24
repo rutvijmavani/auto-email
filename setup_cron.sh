@@ -634,7 +634,7 @@ elif echo "$EXISTING_NON_PIPELINE" | grep -qF "# === BEGIN RECRUITER PIPELINE ==
 fi
 # Strip legacy run_*.sh pipeline entries (pre-marker crontabs)
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
-    grep -Ev '/home/opc/mail/run_(sync|nightly|monday|monthly|outreach|monitor|detect|weekly_summary|enrich|renew_watch|verify_filled|sync_dol_lca)\.sh([[:space:]]|$|[;&|<>"'"'"'])' || true)
+    grep -Ev '/home/opc/mail/run_(sync|nightly|monday|monthly|outreach|monitor|detect|weekly_summary|enrich|renew_watch|verify_filled|sync_dol_lca)\.sh([[:space:]]|$|[;&|<>)"'"'"'])' || true)
 # Strip log_monitor and keep-alive entries (re-added inside the marker block)
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
     grep -v 'scripts/log_monitor\.py' || true)
