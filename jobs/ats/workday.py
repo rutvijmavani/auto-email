@@ -2,15 +2,19 @@
 # Date field: postedOn (RELIABLE — original posting date)
 # Risk: undocumented — monitor for structural changes
 
+import collections
 import json
 import logging
 import math
+import re
 import statistics
 from datetime import datetime
 from config import (
     FETCH_TOLERANCE_PCT, WORKDAY_BUDGET_PAD, WORKDAY_BUDGET_SLACK, WORKDAY_FACET_FLOOR, WORKDAY_FACET_MAXSHARE,
-    WORKDAY_FACET_SUM_TOL, WORKDAY_GAP_PENALTY, WORKDAY_PAGE_SIZE, WORKDAY_PLAN_MAX_DEPTH, WORKDAY_RESULT_CAP,
-    WORKDAY_SPLIT_FACETS,
+    WORKDAY_FACET_SUM_TOL, WORKDAY_GAP_MIN, WORKDAY_GAP_PENALTY, WORKDAY_GAP_TOL, WORKDAY_PAGE_SIZE,
+    WORKDAY_PLAN_MAX_DEPTH, WORKDAY_RESULT_CAP, WORKDAY_SEARCH_CHUNK_PAGES, WORKDAY_SEARCH_IDLE_TERMS,
+    WORKDAY_SEARCH_MIN_NEW, WORKDAY_SEARCH_STOPWORDS, WORKDAY_SEARCH_TERM_MIN_LEN, WORKDAY_SPLIT_FACETS,
+    WORKDAY_WINDOW_MAX,
 )
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 from jobs.ats.fetch_report import (
@@ -591,6 +595,105 @@ def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
         rep["failed"] = True
         logger.warning("workday fetch: request budget used up (%s) — partial result", e)
     return merged, leaf_got
+
+
+def _node_union(applied, leaf_got):
+    """Keys of every fetched leaf that lies inside the node `applied` (its filters are a subset of the leaf's)."""
+    union = set()
+    for leaf_applied, keys in leaf_got:
+        if all(leaf_applied.get(a) == b for a, b in applied.items()):
+            union |= keys
+    return union
+
+
+def _search_node(url, node, merged, leaf_got, tol, company, rep):
+    """
+    Last recovery step for a node still short: searchText terms taken from the titles of jobs already
+    found inside this node, each searched inside the node. New jobs join `merged` and the node's union.
+    A term stops when a chunk adds under WORKDAY_SEARCH_MIN_NEW new jobs; the node stops after
+    WORKDAY_SEARCH_IDLE_TERMS terms in a row add nothing. Sequential, budgeted.
+    """
+    applied, size = node["applied"], node["K"]
+    have = _node_union(applied, leaf_got)
+    tried, idle = set(), 0
+    while size - len(have) > tol and idle < WORKDAY_SEARCH_IDLE_TERMS:
+        words = collections.Counter()
+        for k in have:
+            title = (merged[k].get("title") or "").lower()
+            for w in set(re.findall(r"[a-z]{%d,}" % WORKDAY_SEARCH_TERM_MIN_LEN, title)):
+                if w not in WORKDAY_SEARCH_STOPWORDS and w not in tried:
+                    words[w] += 1
+        if not words:
+            break
+        term = words.most_common(1)[0][0]
+        tried.add(term)
+        new, off, ended = {}, 0, False
+        while off < WORKDAY_RESULT_CAP and not ended:
+            _budget_add(rep, WORKDAY_SEARCH_CHUNK_PAGES)
+            rows = fresh = 0
+            end = min(off + WORKDAY_SEARCH_CHUNK_PAGES * WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP)
+            for o in range(off, end, WORKDAY_PAGE_SIZE):
+                data = _post(url, applied, o, company, rep, text=term)
+                jobs = (data or {}).get("jobPostings") or []
+                if not jobs:
+                    ended = True
+                    break
+                for p in jobs:
+                    rows += 1
+                    k = _job_key(p)
+                    if k not in have and k not in new:
+                        new[k] = p
+                        fresh += 1
+            off = end
+            if rows == 0 or fresh / rows < WORKDAY_SEARCH_MIN_NEW:
+                break
+        have |= set(new)
+        for k, p in new.items():
+            merged[k] = p
+        if new:
+            leaf_got.append((dict(applied), set(new)))
+        idle = 0 if new else idle + 1
+        logger.info("workday search: %r term=%r new=%d unique_now=%d gap=%d applied=%s",
+                    company, term, len(new), len(have), size - len(have), applied)
+
+
+def _recover(url, nodes, merged, leaf_got, company, rep):
+    """
+    Close gaps between a split node's promised count and the unique jobs its leaves returned, deepest
+    node first: within tolerance = done; else a direct window (the node's first WORKDAY_RESULT_CAP jobs,
+    only for nodes up to WORKDAY_WINDOW_MAX x the cap); else searchText. A node still short is recorded
+    in rep["partial"] and sets rep["capped"]. Skipped when any leaf exited early (a short leaf is deliberate).
+    """
+    if rep.get("early"):
+        return
+    try:
+        for node in sorted(nodes, key=lambda n: -n["depth"]):
+            applied, size = node["applied"], node["K"]
+            have = len(_node_union(applied, leaf_got))
+            tol = max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL * size)
+            if size - have <= tol:
+                continue
+            if size <= WORKDAY_WINDOW_MAX * WORKDAY_RESULT_CAP:
+                page1 = (rep.get("node_page1") or {}).get(json.dumps(applied, sort_keys=True)) or {}
+                window = _make_leaf(rep, dict(applied), min(size, WORKDAY_RESULT_CAP), page1.get("jobPostings"))
+                got = _fetch_leaf(url, window, company, rep)   # never gated
+                for k, p in got.items():
+                    merged.setdefault(k, p)
+                leaf_got.append((dict(applied), set(got)))
+                after = len(_node_union(applied, leaf_got))
+                logger.info("workday window: %r size=%d unique %d -> %d applied=%s", company, size, have, after, applied)
+                have = after
+            if size - have > tol:
+                _search_node(url, node, merged, leaf_got, tol, company, rep)
+                have = len(_node_union(applied, leaf_got))
+            if size - have > tol:
+                rep.setdefault("partial", []).append((applied, size, have))
+                rep["capped"] = True
+                logger.warning("workday recover: %r node %s still short after window+search: %d of %d",
+                               company, applied, have, size)
+    except _OverBudget as e:
+        rep["failed"] = True
+        logger.warning("workday recover: request budget used up (%s) — partial result", e)
 
 
 def fetch_job_detail(job):
