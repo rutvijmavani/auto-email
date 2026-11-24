@@ -9,6 +9,7 @@ import math
 import re
 import statistics
 from datetime import datetime
+from urllib.parse import urlparse
 from config import (
     WORKDAY_BUDGET_PAD, WORKDAY_COUNTRY_FILTER_DESCRIPTOR, WORKDAY_COUNTRY_FILTER_FACET,
     WORKDAY_COUNTRY_FILTER_TENANT, WORKDAY_BUDGET_SLACK, WORKDAY_FACET_FLOOR, WORKDAY_FACET_MAXSHARE,
@@ -245,8 +246,12 @@ def _job_key(posting):
     """Identity of a listing across facet slices: its relative path, else req id, else title+location."""
     url = posting.get("externalUrl") or ""
     bare = url.split("#", 1)[0].split("?", 1)[0]    # tracking query/fragment must not make one posting two keys
+    # board-relative posting path, the same form externalPath has (host, locale and site prefix dropped);
+    # only a posting-specific URL counts, a generic one is shared
+    upath = urlparse(bare).path
+    rel = upath[upath.find("/job/"):] if "/job/" in upath else ""
     return (posting.get("externalPath")
-            or (bare if "/job/" in bare else "")    # only a posting-specific URL; a generic one is shared
+            or rel
             or (posting.get("bulletFields") or [""])[0]
             or url
             or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
@@ -472,7 +477,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
 
     def take(jobs, final):
         for p in jobs:
-            got.setdefault(_job_key(p), p)
+            _merge_row(got, _job_key(p), p)
         if leaf_gate is not None and norm is not None and not final \
                 and leaf_gate([j for j in map(norm, jobs) if j]):
             rep["early"] = True
@@ -497,8 +502,14 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                 _budget_add(rep, 1)
                 again = _post(url, leaf["applied"], off, company, rep)
                 if again:
-                    seen = {_job_key(p) for p in jobs}
-                    jobs += [p for p in again.get("jobPostings") or [] if _job_key(p) not in seen]
+                    pos = {_job_key(p): n for n, p in enumerate(jobs)}
+                    for p in again.get("jobPostings") or []:
+                        k = _job_key(p)
+                        if k not in pos:
+                            pos[k] = len(jobs)
+                            jobs.append(p)
+                        elif p.get("title") and not jobs[pos[k]].get("title"):
+                            jobs[pos[k]] = p   # a titled copy replaces a titleless one
                 elif not data:
                     rep["failed"] = True
                     logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",

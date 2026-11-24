@@ -84,7 +84,7 @@ if atci_with_path:
     job = atci_with_path[0]
     external_path = job["_external_path"]
     detail_url = (
-        f"{workday_domain(slug, wd)}"
+        f"{workday_domain(slug, wd, slug_info.get("site"))}"
         f"/wday/cxs/{slug}/{path}{external_path}"
     )
     print(f"Detail URL: {detail_url}")
@@ -119,7 +119,7 @@ if r00_with_path:
     job = r00_with_path[0]
     external_path = job["_external_path"]
     detail_url = (
-        f"{workday_domain(slug, wd)}"
+        f"{workday_domain(slug, wd, slug_info.get("site"))}"
         f"/wday/cxs/{slug}/{path}{external_path}"
     )
     print(f"Detail URL: {detail_url}")

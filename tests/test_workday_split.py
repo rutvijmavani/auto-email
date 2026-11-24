@@ -254,7 +254,10 @@ def test_job_key_falls_back_to_external_url():
     assert k({"externalPath": "/job/a", "externalUrl": "https://x.com/1"}) == "/job/a"
     # a generic (non "/job/") URL shared by postings must not beat the bullet id
     assert k({"externalUrl": "https://x.com/careers", "bulletFields": ["R-1"]}) == "R-1"
-    assert k({"externalUrl": "https://x.com/job/1", "bulletFields": ["R-1"]}) == "https://x.com/job/1"
+    # a posting URL keys like its externalPath: board-relative, host / locale / site prefix dropped
+    assert k({"externalUrl": "https://x.com/en-US/Site/job/1", "bulletFields": ["R-1"]}) == "/job/1"
+    assert k({"externalUrl": "https://x.com/job/1"}) == k({"externalPath": "/job/1"})
+    assert k({"externalUrl": "https://x.com/job/1"}) != k({"externalUrl": "https://x.com/job/2"})
 
 
 def test_job_id_rule():
