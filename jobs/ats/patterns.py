@@ -107,7 +107,7 @@ def _make_patterns():
         wd     = (m.group(2) or "").lower()   # "" = bare host ({tenant}.myworkdayjobs.com)
         if not wd and tenant in WORKDAY_NON_TENANT:
             return None
-        raw_path = m.group(3).rstrip("/")
+        raw_path = (m.group(3) or "").rstrip("/")   # no path at all = the bare host
         parts    = [p for p in raw_path.split("/") if p]
         # Skip locale prefix (en-US, fr-FR, zh-CN, etc.)
         path = next(
@@ -123,7 +123,7 @@ def _make_patterns():
     patterns.append((
         re.compile(
             # (?<![a-z0-9.-]) keeps "a.b.myworkdayjobs.com" from reading "b" as a bare tenant.
-            r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com/([^?&#\s\"'<>]*)",
+            r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?:/([^?&#\s\"'<>]*))?",
             re.IGNORECASE
         ),
         "workday",

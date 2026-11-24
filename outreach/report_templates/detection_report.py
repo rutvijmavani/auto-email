@@ -330,9 +330,11 @@ def _build_verify_url(platform, slug):
             info = json.loads(slug)
             s    = info.get("slug", "")
             from jobs.ats.workday import wd_present, workday_domain
-            wd = info.get("wd", "wd5")
-            if info.get("site") and not wd_present(wd, info.get("site")):
-                return "#"   # myworkdaysite builds its host from wd
+            site = info.get("site")
+            # the legacy "wd5" default is only for ordinary records whose wd key is absent
+            wd = info["wd"] if "wd" in info else (None if site else "wd5")
+            if not wd_present(wd, site):
+                return "#"   # null wd, or empty wd on myworkdaysite (its host is built from wd)
             base = workday_domain(s, wd, info.get("site"))
             path = info.get("path") or "careers"
             if info.get("site") == "myworkdaysite":

@@ -390,7 +390,9 @@ def _choose_facet(cands, size):
 def _make_leaf(rep, applied, size, first=None):
     """A query below the cap that is paged to its end. `first` = page 1 when already fetched."""
     first = list(first or [])
-    offs = list(range(len(first), size, WORKDAY_PAGE_SIZE))
+    # a cached page 1 that came back short is fetched again from offset 0; a full one costs no request
+    start = len(first) if len(first) >= min(WORKDAY_PAGE_SIZE, size) else 0
+    offs = list(range(start, size, WORKDAY_PAGE_SIZE))
     _budget_add(rep, len(offs))
     return {"applied": applied, "K": size, "first": first, "offs": offs}
 
@@ -488,8 +490,10 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
             expect = min(WORKDAY_PAGE_SIZE, leaf["K"] - off)   # the last page is legitimately short
             data = _post(url, leaf["applied"], off, company, rep)
             jobs = list(data.get("jobPostings") or []) if data else []
+            retried = False
             if not data or len(jobs) < expect:
                 # retried here, before the gate sees the page: a short page must not look "all seen"
+                retried = True
                 _budget_add(rep, 1)
                 again = _post(url, leaf["applied"], off, company, rep)
                 if again:
@@ -500,8 +504,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                     logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
                                    off, company, leaf["applied"])
                     continue
-            # a page still short after the retry keeps its rows but is not shown to the gate
-            if take(jobs, i == len(offs) - 1 or len(jobs) < expect):
+            # a page that needed a retry (two responses merged) or is still short keeps its rows but is not gated
+            if take(jobs, i == len(offs) - 1 or len(jobs) < expect or retried):
                 stopped = True
                 break
     except _OverBudget as e:
@@ -514,6 +518,12 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     return got
 
 
+def _merge_row(merged, k, p):
+    """First row per key wins, except that a titled row replaces a titleless one."""
+    if k not in merged or (p.get("title") and not merged[k].get("title")):
+        merged[k] = p
+
+
 def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
     """Fetch the leaves one after another. Returns (merged {job_key: posting}, [(applied, {keys})])."""
     merged, leaf_got = {}, []
@@ -521,13 +531,13 @@ def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
         for leaf in leaves:
             got = _fetch_leaf(url, leaf, company, rep, gate, norm)
             for k, p in got.items():
-                merged.setdefault(k, p)
+                _merge_row(merged, k, p)
             leaf_got.append((leaf["applied"], set(got)))
     except _OverBudget as e:
         rep["failed"] = True
         partial = getattr(e, "got", None) or {}
         for k, p in partial.items():
-            merged.setdefault(k, p)
+            _merge_row(merged, k, p)
         if partial:
             leaf_got.append((leaf["applied"], set(partial)))
         logger.warning("workday fetch: request budget used up (%s) — partial result", e)
@@ -543,7 +553,7 @@ def _keep_node_page1(nodes, merged, leaf_got, rep):
         keys = set()
         for p in page:
             k = _job_key(p)
-            merged.setdefault(k, p)
+            _merge_row(merged, k, p)
             keys.add(k)
         if keys:
             leaf_got.append((dict(node["applied"]), keys))
@@ -637,7 +647,7 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
                 window = _make_leaf(rep, dict(applied), min(size, WORKDAY_RESULT_CAP), page1.get("jobPostings"))
                 got = _fetch_leaf(url, window, company, rep)   # never gated
                 for k, p in got.items():
-                    merged.setdefault(k, p)
+                    _merge_row(merged, k, p)
                 leaf_got.append((dict(applied), set(got)))
                 after = len(_node_union(applied, leaf_got))
                 logger.info("workday window: %r size=%d unique %d -> %d applied=%s", company, size, have, after, applied)

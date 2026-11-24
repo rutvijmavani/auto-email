@@ -279,7 +279,7 @@ from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
 def _extract_workday(text):
     # wd group optional: bare host {tenant}.myworkdayjobs.com is stored as "wd": "".
     for m in re.finditer(
-        r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]+)?)?',
+        r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]+)?)?',
         text, re.IGNORECASE,
     ):
         if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:

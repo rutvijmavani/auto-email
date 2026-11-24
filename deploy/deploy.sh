@@ -84,6 +84,11 @@ _rollback_to_previous() {
             || echo "  [FATAL] pip rollback failed"
         sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
         sudo systemctl daemon-reload || true
+        # wrappers/crontab regenerated from the new setup_cron.sh must go back with the code
+        if ${_CRON_REGENERATED:-false}; then
+            bash "$PROJECT_DIR/setup_cron.sh" \
+                || echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually"
+        fi
     else
         echo "  [WARN] Skipping pip install and unit sync — code state unknown"
     fi
@@ -138,6 +143,7 @@ _pull_err() {
 }
 
 _CRON_PENDING_FLAG="$PROJECT_DIR/data/.cron_regen_pending"
+_CRON_REGENERATED=false
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
@@ -228,6 +234,7 @@ elif [[ -n "$_missing_wrappers" ]] || [[ -f "$_CRON_PENDING_FLAG" ]]; then
     fi
     if bash "$PROJECT_DIR/setup_cron.sh"; then
         rm -f "$_CRON_PENDING_FLAG"
+        _CRON_REGENERATED=true   # a later rollback re-runs the old setup_cron.sh
         echo "  Cron wrappers regenerated."
     else
         echo "  [WARN] setup_cron.sh failed — cron jobs may not run; fix manually"

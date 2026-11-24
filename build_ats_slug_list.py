@@ -489,11 +489,16 @@ def extract_slug(row):
 
     Returns (platform, slug) or None.
     """
-    domain = str(row.get("url_host_registered_domain", "") or "")
-    third  = str(row.get("url_host_3rd_last_part", "") or "")
-    fourth = str(row.get("url_host_4th_last_part", "") or "")
-    fifth  = str(row.get("url_host_5th_last_part", "") or "")
-    path   = str(row.get("url_path", "") or "")
+    def _cell(name):
+        # a cached CSV reads a missing label back as NaN (truthy): treat it as empty, not "nan"
+        v = row.get(name, "")
+        return "" if v is None or (isinstance(v, float) and v != v) else str(v)
+
+    domain = _cell("url_host_registered_domain")
+    third  = _cell("url_host_3rd_last_part")
+    fourth = _cell("url_host_4th_last_part")
+    fifth  = _cell("url_host_5th_last_part")
+    path   = _cell("url_path")
 
     # ── Greenhouse ──────────────────────────────────────
     if domain == "greenhouse.io":
