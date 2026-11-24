@@ -182,6 +182,12 @@ def fetch_jobs(slug_info, company, stop_check=None):
     Returns list of normalized job dicts.
     slug_info = {"slug": "att", "wd": "wd1", "path": "ATTGeneral"}
     """
+    if not wd_present(slug_info.get("wd"), slug_info.get("site")):
+        logger.warning("workday fetch: %r has no usable wd in %s — nothing fetched", company, slug_info)
+        return attach([], FetchReport(
+            stop_reason=STOP_NO_CONFIG, pages=0, fetched_distinct=0, unusable=0,
+            reported_total=None, total_source=TOTAL_ATS, note="wd missing",
+        ))
     url    = _build_url(slug_info)
     domain = _build_domain(slug_info)
     path   = slug_info.get("path", "careers")  # e.g. "ATTGeneral"
@@ -203,6 +209,8 @@ def fetch_jobs(slug_info, company, stop_check=None):
             return _filter_missing_result(rep)
     leaves, nodes = _plan_board(url, company, rep, base)
     merged, leaf_got = _fetch_leaves(url, leaves, company, rep, gate=stop_check, norm=norm)
+    if rep.get("leaf_mismatch") and not nodes:
+        rep["capped"] = True   # a flat board has no node recovery: rows its leaf lost stay lost
     _keep_node_page1(nodes, merged, leaf_got, rep)
     _recover(url, nodes, merged, leaf_got, company, rep)
     all_jobs = list(merged.values())
@@ -424,6 +432,20 @@ def _plan_board(url, company, rep, base=None):
                 continue
             total = data.get("total", 0) or 0
             first = data.get("jobPostings") or []
+            if total > 0 and not first:
+                # an empty page 1 must not decide flat vs split: ask once more
+                _budget_add(rep, 1)
+                again = _post(url, applied, 0, company, rep)
+                if again and again.get("jobPostings"):
+                    data = again
+                    rep["node_page1"][json.dumps(applied, sort_keys=True)] = again
+                    total = data.get("total", 0) or total
+                    first = data["jobPostings"]
+                elif total >= WORKDAY_RESULT_CAP:
+                    rep["failed"] = True
+                    logger.warning("workday plan: page 1 empty for %r applied=%s (total=%d) — slice skipped",
+                                   company, applied, total)
+                    continue
             if depth == 0:
                 rep["reported"] = total
             capped = False
@@ -570,13 +592,14 @@ def _keep_node_page1(nodes, merged, leaf_got, rep):
             leaf_got.append((dict(node["applied"]), keys))
 
 
-def _node_union(applied, leaf_got):
-    """Keys of every fetched leaf that lies inside the node `applied` (its filters are a subset of the leaf's)."""
+def _node_union(applied, leaf_got, merged):
+    """Keys of every fetched leaf that lies inside the node `applied` (its filters are a subset of the leaf's).
+    Titleless rows are left out: they are dropped from the result, so they close no gap."""
     union = set()
     for leaf_applied, keys in leaf_got:
         if all(leaf_applied.get(a) == b for a, b in applied.items()):
             union |= keys
-    return union
+    return {k for k in union if (merged.get(k) or {}).get("title")}
 
 
 def _search_node(url, node, merged, leaf_got, tol, company, rep):
@@ -587,7 +610,7 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep):
     WORKDAY_SEARCH_IDLE_TERMS terms in a row add nothing. Sequential, budgeted.
     """
     applied, size = node["applied"], node["K"]
-    have = _node_union(applied, leaf_got)
+    have = _node_union(applied, leaf_got, merged)
     tried, idle = set(), 0
     # a search may spend what the facet would have cost to miss these jobs, no more
     allowance = WORKDAY_GAP_PENALTY * (size - len(have)) / WORKDAY_PAGE_SIZE
@@ -618,7 +641,10 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep):
                 for p in jobs:
                     rows += 1
                     k = _job_key(p)
-                    if k not in have and k not in new:
+                    if not p.get("title"):
+                        if k not in merged:
+                            merged[k] = p   # kept so a later titled copy can replace it; closes no gap
+                    elif k not in have and k not in new:
                         new[k] = p
                         fresh += 1
             off = end
@@ -626,8 +652,7 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep):
                 break
         have |= set(new)
         for k, p in new.items():
-            if k not in merged or (p.get("title") and not merged[k].get("title")):
-                merged[k] = p   # a titleless hit never replaces a titled row
+            _merge_row(merged, k, p)
         if new:
             leaf_got.append((dict(applied), set(new)))
         idle = 0 if new else idle + 1
@@ -649,8 +674,8 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
             applied, size = node["applied"], node["K"]
             if any(all(e.get(a) == b for a, b in applied.items()) for e in early):
                 continue   # a leaf inside this node exited early on purpose: its shortfall is deliberate
-            have = len(_node_union(applied, leaf_got))
-            tol = max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL * size)
+            have = len(_node_union(applied, leaf_got, merged))
+            tol =max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL * size)
             if size - have <= tol:
                 continue
             if size <= WORKDAY_WINDOW_MAX * WORKDAY_RESULT_CAP:
@@ -660,12 +685,12 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
                 for k, p in got.items():
                     _merge_row(merged, k, p)
                 leaf_got.append((dict(applied), set(got)))
-                after = len(_node_union(applied, leaf_got))
+                after = len(_node_union(applied, leaf_got, merged))
                 logger.info("workday window: %r size=%d unique %d -> %d applied=%s", company, size, have, after, applied)
                 have = after
             if size - have > tol:
                 _search_node(url, node, merged, leaf_got, tol, company, rep)
-                have = len(_node_union(applied, leaf_got))
+                have = len(_node_union(applied, leaf_got, merged))
             if size - have > tol:
                 rep.setdefault("partial", []).append((applied, size, have))
                 rep["capped"] = True

@@ -171,6 +171,20 @@ class TestBuildDetailPayloadKeyForwarding(unittest.TestCase):
         ok.pop("_wd")
         self.assertTrue(_is_stale_workday(json.dumps(ok)))
 
+    def test_purge_null_slug_is_stale(self):
+        import json
+        from scripts import purge_stale_detail_payloads as purge
+        bad = {"ats_platform": "workday", "_slug": None, "_wd": "", "_path": "careers"}
+        good = {"ats_platform": "workday", "_slug": "nxp", "_wd": "", "_path": "careers"}
+
+        class FakeRedis:
+            def lrange(self, key, a, b):
+                return [json.dumps(bad), json.dumps(good)]
+        self.assertEqual(purge._purge_list(FakeRedis(), "q", dry_run=True), (2, 1))
+        # the Lua filter (run by Redis on apply) must treat a JSON null the same way
+        self.assertIn("parsed['_slug'] == cjson.null", purge._FILTER_LUA)
+        self.assertIn("parsed['_path'] == cjson.null", purge._FILTER_LUA)
+
     def test_taleo_keys_forwarded(self):
         """Taleo required keys: _base_url, _contest_no, _section."""
         job = _minimal_job(

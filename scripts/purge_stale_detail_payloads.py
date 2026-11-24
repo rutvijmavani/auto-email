@@ -68,10 +68,10 @@ for _, item in ipairs(items) do
     local ok, parsed = pcall(cjson.decode, item)
     local stale = false
     if ok and type(parsed) == 'table' and parsed['ats_platform'] == 'workday' then
-        if not parsed['_slug'] or parsed['_slug'] == ''
+        if not parsed['_slug'] or parsed['_slug'] == '' or parsed['_slug'] == cjson.null
         or parsed['_wd'] == nil or parsed['_wd'] == cjson.null
         or (parsed['_wd'] == '' and parsed['_site'] == 'myworkdaysite')
-        or not parsed['_path'] or parsed['_path'] == '' then
+        or not parsed['_path'] or parsed['_path'] == '' or parsed['_path'] == cjson.null then
             stale = true
         end
     end
