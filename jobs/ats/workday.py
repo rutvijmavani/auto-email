@@ -196,7 +196,7 @@ def fetch_jobs(slug_info, company, stop_check=None):
         def norm(j):
             return _normalize(j, company, domain, path, slug_info) if j.get("title") else None
     base = {}
-    if slug_info.get("slug") == WORKDAY_COUNTRY_FILTER_TENANT:
+    if str(slug_info.get("slug") or "").lower() == str(WORKDAY_COUNTRY_FILTER_TENANT).lower():
         base = _country_filter(url, company, rep)
         if base is None:   # filter value missing: never fall back to the unfiltered board
             return _filter_missing_result(rep)
@@ -243,6 +243,7 @@ def fetch_jobs(slug_info, company, stop_check=None):
 def _job_key(posting):
     """Identity of a listing across facet slices: its relative path, else req id, else title+location."""
     return (posting.get("externalPath")
+            or posting.get("externalUrl")
             or (posting.get("bulletFields") or [""])[0]
             or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
 
@@ -262,7 +263,7 @@ def _board_is_capped(url, applied, first_jobs, rep, company):
     cached = None if rep is None else rep.get("capped_board")
     if cached is not None:
         return cached
-    first_key = _job_key(first_jobs[0]) if first_jobs else None
+    first_keys = {_job_key(p) for p in first_jobs or []}
     body = {"limit": WORKDAY_PAGE_SIZE, "offset": WORKDAY_RESULT_CAP}
     if applied:
         body["appliedFacets"] = applied
@@ -274,7 +275,7 @@ def _board_is_capped(url, applied, first_jobs, rep, company):
                        WORKDAY_RESULT_CAP, company)
         return True
     probe_jobs = data.get("jobPostings") or []
-    capped = bool(probe_jobs) and first_key is not None and _job_key(probe_jobs[0]) == first_key
+    capped = bool(probe_jobs) and bool(first_keys & {_job_key(p) for p in probe_jobs})   # any repeat of page 1 = capped
     if rep is not None:
         rep["capped_board"] = capped
     logger.info("workday fetch: %r cap probe at offset=%d -> %s", company, WORKDAY_RESULT_CAP,
@@ -471,20 +472,21 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         return False
 
     offs = leaf["offs"]
-    if leaf["first"] and take(leaf["first"], final=not offs):
-        return got
     retry = []
-    for i, off in enumerate(offs):
-        data = _post(url, leaf["applied"], off, company, rep)
-        if not data:
-            retry.append(off)
-            continue
-        jobs = data.get("jobPostings") or []
-        final = i == len(offs) - 1
-        if len(jobs) < WORKDAY_PAGE_SIZE and not final:
-            retry.append(off)
-        if take(jobs, final):
-            return got
+    stopped = bool(leaf["first"]) and take(leaf["first"], final=not offs)
+    if not stopped:
+        for i, off in enumerate(offs):
+            data = _post(url, leaf["applied"], off, company, rep)
+            if not data:
+                retry.append(off)
+                continue
+            jobs = data.get("jobPostings") or []
+            final = i == len(offs) - 1
+            if len(jobs) < min(WORKDAY_PAGE_SIZE, leaf["K"] - off):   # the last page is legitimately short
+                retry.append(off)
+            if take(jobs, final):
+                stopped = True
+                break
     for off in retry:
         _budget_add(rep, 1)
         data = _post(url, leaf["applied"], off, company, rep)
@@ -495,7 +497,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
             continue
         for p in data.get("jobPostings") or []:
             got.setdefault(_job_key(p), p)
-    if len(got) != leaf["K"]:
+    if not stopped and len(got) != leaf["K"]:
         rep.setdefault("leaf_mismatch", []).append((leaf["applied"], leaf["K"], len(got)))
     return got
 
@@ -534,7 +536,10 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep):
     applied, size = node["applied"], node["K"]
     have = _node_union(applied, leaf_got)
     tried, idle = set(), 0
-    while size - len(have) > tol and idle < WORKDAY_SEARCH_IDLE_TERMS:
+    # a search may spend what the facet would have cost to miss these jobs, no more
+    allowance = WORKDAY_GAP_PENALTY * (size - len(have)) / WORKDAY_PAGE_SIZE
+    spent = 0
+    while size - len(have) > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and spent < allowance:
         words = collections.Counter()
         for k in have:
             title = (merged[k].get("title") or "").lower()
@@ -548,6 +553,7 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep):
         new, off, ended = {}, 0, False
         while off < WORKDAY_RESULT_CAP and not ended:
             _budget_add(rep, WORKDAY_SEARCH_CHUNK_PAGES)
+            spent += WORKDAY_SEARCH_CHUNK_PAGES
             rows = fresh = 0
             end = min(off + WORKDAY_SEARCH_CHUNK_PAGES * WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP)
             for o in range(off, end, WORKDAY_PAGE_SIZE):

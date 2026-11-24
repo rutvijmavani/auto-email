@@ -94,7 +94,7 @@ def test_cheapest_facet_is_chosen():
              for i in range(2700)]
     board = Board(jobs_)
     _run(board)
-    assert all(set(c["appliedFacets"]) == {"fam"} for c in board.split_calls())
+    assert board.split_calls() and all(set(c["appliedFacets"]) == {"fam"} for c in board.split_calls())
 
 
 def test_slice_with_no_usable_facet_is_flagged():
@@ -245,6 +245,12 @@ def test_flatten_facets_expands_nested_location_groups():
 def test_board_size_is_the_median_of_the_agreeing_sums():
     cands = [("a", [], 2700), ("b", [], 2710), ("c", [], 3152), ("d", [], 941)]
     assert workday._board_size(cands) == 2705
+
+
+def test_job_key_falls_back_to_external_url():
+    k = workday._job_key
+    assert k({"externalUrl": "https://x.com/1", "title": "T"}) != k({"externalUrl": "https://x.com/2", "title": "T"})
+    assert k({"externalPath": "/job/a", "externalUrl": "https://x.com/1"}) == "/job/a"
 
 
 def test_job_id_rule():

@@ -121,7 +121,7 @@ def _make_patterns():
     patterns.append((
         re.compile(
             # (?<![a-z0-9.-]) keeps "a.b.myworkdayjobs.com" from reading "b" as a bare tenant.
-            r"(?<![a-z0-9.-])([a-z0-9]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com/([^?&#\s]*)",
+            r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com/([^?&#\s]*)",
             re.IGNORECASE
         ),
         "workday",

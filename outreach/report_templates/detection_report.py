@@ -330,7 +330,11 @@ def _build_verify_url(platform, slug):
             info = json.loads(slug)
             s    = info.get("slug", "")
             from jobs.ats.workday import workday_domain
-            return f"{workday_domain(s, info.get('wd', 'wd5'), info.get('site'))}/careers"
+            base = workday_domain(s, info.get("wd", "wd5"), info.get("site"))
+            path = info.get("path") or "careers"
+            if info.get("site") == "myworkdaysite":
+                return f"{base}/recruiting/{s}/{path}"
+            return f"{base}/{path}"
         except (json.JSONDecodeError, TypeError):
             return "#"
 

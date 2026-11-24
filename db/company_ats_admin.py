@@ -62,7 +62,8 @@ def validate_platform_slug(platform: str, slug: str) -> "tuple[str | None, str |
             # string; only myworkdaysite needs a non-empty value (workday.wd_present).
             missing = [k for k in required if k != "wd"
                        and (not isinstance(obj.get(k), str) or not obj[k].strip())]
-            if not isinstance(obj.get("wd"), str) or not workday.wd_present(obj["wd"].strip(), obj.get("site")):
+            wd = obj.get("wd")
+            if not isinstance(wd, str) or wd != wd.strip() or not workday.wd_present(wd, obj.get("site")):
                 missing.append("wd")
         else:
             missing = [k for k in required

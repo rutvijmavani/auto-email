@@ -247,7 +247,11 @@ def enrich_workday(slug):
             return None, "skip"
 
         # Try fetching careers page for title
-        url = f"{workday_domain(tenant, wd, slug_data.get('site'))}/{path}"
+        base = workday_domain(tenant, wd, slug_data.get("site"))
+        if slug_data.get("site") == "myworkdaysite":
+            url = f"{base}/recruiting/{tenant}/{path}"   # myworkdaysite pages live under /recruiting/{tenant}/
+        else:
+            url = f"{base}/{path}"
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
                            allow_redirects=True)
 
