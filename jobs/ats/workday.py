@@ -2,9 +2,16 @@
 # Date field: postedOn (RELIABLE — original posting date)
 # Risk: undocumented — monitor for structural changes
 
+import json
 import logging
+import math
+import statistics
 from datetime import datetime
-from config import FETCH_TOLERANCE_PCT, WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP, WORKDAY_SPLIT_FACETS
+from config import (
+    FETCH_TOLERANCE_PCT, WORKDAY_BUDGET_PAD, WORKDAY_BUDGET_SLACK, WORKDAY_FACET_FLOOR, WORKDAY_FACET_MAXSHARE,
+    WORKDAY_FACET_SUM_TOL, WORKDAY_GAP_PENALTY, WORKDAY_PAGE_SIZE, WORKDAY_PLAN_MAX_DEPTH, WORKDAY_RESULT_CAP,
+    WORKDAY_SPLIT_FACETS,
+)
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 from jobs.ats.fetch_report import (
     FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
@@ -368,6 +375,222 @@ def _collect(url, applied, used, first, company, rep=None, slice_count=None, gat
         logger.info("workday fetch: %r split by %s into %d slices, %d distinct jobs",
                     company, name, len(values), len(merged))
     return list(merged.values())
+
+
+# ── Planner (design P3, step 9) ─────────────────────────────────────────────────────────────────────
+# A capped board is split by the facet with the lowest request cost into leaves (each below the cap),
+# the leaves are paged one after another, and every request counts against a hard budget. Not wired
+# into fetch_jobs yet (step 11 swaps it in for _collect).
+
+class _OverBudget(Exception):
+    """The scan used its request budget: planned requests x (1 + slack) + a pad per slice."""
+
+
+def _budget_add(rep, cost):
+    """Raise the request budget for `cost` planned requests (one pad per call = per slice)."""
+    rep["budget"] = rep.get("budget", 0.0) + cost * (1 + WORKDAY_BUDGET_SLACK) + WORKDAY_BUDGET_PAD
+
+
+def _post(url, applied, offset, company, rep, text=None):
+    """One list request, counted against the budget. Raises _OverBudget past it; returns the JSON or None."""
+    if rep.get("logical", 0) >= rep.get("budget", 0.0):
+        rep["over_budget"] = True
+        raise _OverBudget(f"{company}: {rep.get('logical', 0)} requests >= budget {rep.get('budget', 0.0):.0f}")
+    rep["logical"] = rep.get("logical", 0) + 1
+    rep["pages"] += 1
+    body = {"limit": WORKDAY_PAGE_SIZE, "offset": offset}
+    if applied:
+        body["appliedFacets"] = applied
+    if text:
+        body["searchText"] = text
+    return fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday")
+
+
+def _page1(url, applied, company, rep):
+    """Page 1 of a query (total, jobs, facets), cached per scan; None when the request failed."""
+    cache = rep.setdefault("node_page1", {})
+    k = json.dumps(applied, sort_keys=True)
+    if k in cache:
+        return cache[k]
+    _budget_add(rep, 1)
+    data = _post(url, applied, 0, company, rep)
+    if data:
+        cache[k] = data
+    return data or None
+
+
+def _facet_candidates(facets, used):
+    """(name, values, sum) for every unused facet with 2+ non-empty values (nested groups flattened)."""
+    out = []
+    for f in _flatten_facets(facets or []):
+        name = f.get("facetParameter")
+        vals = [v for v in f.get("values") or [] if isinstance(v, dict) and v.get("id") and v.get("count", 0) > 0]
+        if name and name not in used and len(vals) >= 2:
+            out.append((name, vals, sum(v["count"] for v in vals)))
+    return out
+
+
+def _board_size(cands):
+    """Median of the largest group of facet sums within WORKDAY_FACET_SUM_TOL of each other (tie: larger)."""
+    sums = sorted(s for _, _, s in cands if s > WORKDAY_PAGE_SIZE)
+    best = None
+    for a in sums:
+        members = [s for s in sums if abs(s - a) <= WORKDAY_FACET_SUM_TOL * a]
+        key = (len(members), statistics.median(members))
+        if best is None or key > best[0]:
+            best = (key, members)
+    return int(statistics.median(best[1])) if best else None
+
+
+def _facet_score(values, total, size):
+    """Request cost of splitting by this facet: its pages, +2 per value still at the cap, + a penalty
+    for jobs the facet would miss (size - total)."""
+    pages = sum(math.ceil(v["count"] / WORKDAY_PAGE_SIZE) for v in values)
+    over = sum(1 for v in values if v["count"] >= WORKDAY_RESULT_CAP)
+    return pages + 2 * over + WORKDAY_GAP_PENALTY * max(0, size - total) / WORKDAY_PAGE_SIZE
+
+
+def _choose_facet(cands, size):
+    """The cheapest candidate that covers most of the slice, preferring facets that really split it."""
+    ok = [c for c in cands if c[2] >= WORKDAY_FACET_FLOOR * size]
+    split = [c for c in ok if max(v["count"] for v in c[1]) <= WORKDAY_FACET_MAXSHARE * size] or ok
+    ranked = sorted(split, key=lambda c: _facet_score(c[1], c[2], size))
+    return ranked[0] if ranked else None
+
+
+def _make_leaf(rep, applied, size, first=None):
+    """A query below the cap that is paged to its end. `first` = page 1 when already fetched."""
+    first = list(first or [])
+    offs = list(range(len(first), size, WORKDAY_PAGE_SIZE))
+    _budget_add(rep, len(offs))
+    return {"applied": applied, "K": size, "first": first, "offs": offs}
+
+
+def _plan_board(url, company, rep, base=None):
+    """
+    Iterative work list over the board. Returns (leaves, nodes): leaves are queries below the cap,
+    nodes are the capped queries that were split (applied, K, facet, depth, sum, used) for the recovery steps.
+
+    rep gets "reported" (page-1 total of the root query), "expected" (the board size, only when split),
+    "capped" (a slice that no facet can split), "failed" (a node's page 1 failed), "over_budget".
+    `base` = filters applied to the whole board (the Accenture US filter).
+    """
+    base = dict(base or {})
+    leaves, nodes = [], []
+    work = [(base, None, tuple(base), 0)]
+    try:
+        while work:
+            applied, size, used, depth = work.pop()
+            data = _page1(url, applied, company, rep)
+            if data is None:
+                rep["failed"] = True
+                logger.warning("workday plan: page 1 failed for %r applied=%s — slice skipped", company, applied)
+                continue
+            total = data.get("total", 0) or 0
+            first = data.get("jobPostings") or []
+            if depth == 0:
+                rep["reported"] = total
+            capped = False
+            if total >= WORKDAY_RESULT_CAP and first:
+                if rep.get("capped_board") is None:
+                    _budget_add(rep, 1)
+                    rep["logical"] = rep.get("logical", 0) + 1   # the probe is one request
+                capped = _board_is_capped(url, applied, first, rep, company)
+            if not capped:
+                leaves.append(_make_leaf(rep, applied, total, first))
+                continue
+            cands = _facet_candidates(data.get("facets"), used)
+            if size is None:
+                size = _board_size(cands) or total
+                rep["expected"] = size
+            best = _choose_facet(cands, size) if depth < WORKDAY_PLAN_MAX_DEPTH else None
+            if best is None:
+                keep = min(WORKDAY_RESULT_CAP, total)
+                leaves.append(_make_leaf(rep, applied, keep, first))
+                rep["capped"] = True
+                (logger.info if depth else logger.warning)(
+                    "workday plan: %r slice %s has %d jobs and no usable facet — first %d only",
+                    company, applied, size, keep)
+                continue
+            name, values, covered = best
+            nodes.append({"applied": dict(applied), "K": size, "facet": name, "depth": depth,
+                          "sum": covered, "used": used})
+            logger.info("workday plan: %r depth=%d size=%d split by %s (%d values, sum=%d)",
+                        company, depth, size, name, len(values), covered)
+            for v in values:
+                child = {**applied, name: [v["id"]]}
+                if v["count"] < WORKDAY_RESULT_CAP:
+                    leaves.append(_make_leaf(rep, child, v["count"]))
+                else:
+                    work.append((child, v["count"], used + (name,), depth + 1))
+    except _OverBudget as e:
+        rep["failed"] = True
+        logger.warning("workday plan: request budget used up while planning (%s) — partial result", e)
+    return leaves, nodes
+
+
+def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
+    """
+    Page one leaf sequentially. Returns {job_key: posting}. The early-exit gate (fresh per leaf) sees
+    every non-final page; True ends the leaf and sets rep["early"]. Pages that failed or came back short
+    are requested once more; a leaf that still does not match its promised count is recorded in
+    rep["leaf_mismatch"] (leaf totals are exact).
+    """
+    got = {}
+    leaf_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
+
+    def take(jobs, final):
+        for p in jobs:
+            got.setdefault(_job_key(p), p)
+        if leaf_gate is not None and norm is not None and not final \
+                and leaf_gate([j for j in map(norm, jobs) if j]):
+            rep["early"] = True
+            return True
+        return False
+
+    offs = leaf["offs"]
+    if leaf["first"] and take(leaf["first"], final=not offs):
+        return got
+    retry = []
+    for i, off in enumerate(offs):
+        data = _post(url, leaf["applied"], off, company, rep)
+        if not data:
+            retry.append(off)
+            continue
+        jobs = data.get("jobPostings") or []
+        final = i == len(offs) - 1
+        if len(jobs) < WORKDAY_PAGE_SIZE and not final:
+            retry.append(off)
+        if take(jobs, final):
+            return got
+    for off in retry:
+        _budget_add(rep, 1)
+        data = _post(url, leaf["applied"], off, company, rep)
+        if not data:
+            rep["failed"] = True
+            logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
+                           off, company, leaf["applied"])
+            continue
+        for p in data.get("jobPostings") or []:
+            got.setdefault(_job_key(p), p)
+    if len(got) != leaf["K"]:
+        rep.setdefault("leaf_mismatch", []).append((leaf["applied"], leaf["K"], len(got)))
+    return got
+
+
+def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
+    """Fetch the leaves one after another. Returns (merged {job_key: posting}, [(applied, {keys})])."""
+    merged, leaf_got = {}, []
+    try:
+        for leaf in leaves:
+            got = _fetch_leaf(url, leaf, company, rep, gate, norm)
+            for k, p in got.items():
+                merged.setdefault(k, p)
+            leaf_got.append((leaf["applied"], set(got)))
+    except _OverBudget as e:
+        rep["failed"] = True
+        logger.warning("workday fetch: request budget used up (%s) — partial result", e)
+    return merged, leaf_got
 
 
 def fetch_job_detail(job):
