@@ -18,6 +18,16 @@ set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$DEPLOY_DIR")"
+
+# One deploy at a time: concurrent runs would race on the pull, setup_cron.sh, the wrapper
+# regeneration and the data/.cron_regen_pending flag. The lock is held until this shell exits.
+mkdir -p "$PROJECT_DIR/data"
+exec 9>"$PROJECT_DIR/data/.deploy.lock"
+if ! flock -n 9; then
+    echo "[ERROR] Another deploy is already running (lock: $PROJECT_DIR/data/.deploy.lock) — aborting."
+    exit 1
+fi
+
 SKIP_HEALTH=false
 NO_RESTART=false
 

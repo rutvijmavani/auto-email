@@ -202,6 +202,7 @@ def fetch_jobs(slug_info, company, stop_check=None):
             return _filter_missing_result(rep)
     leaves, nodes = _plan_board(url, company, rep, base)
     merged, leaf_got = _fetch_leaves(url, leaves, company, rep, gate=stop_check, norm=norm)
+    _keep_node_page1(nodes, merged, leaf_got, rep)
     _recover(url, nodes, merged, leaf_got, company, rep)
     all_jobs = list(merged.values())
 
@@ -474,31 +475,27 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         return False
 
     offs = leaf["offs"]
-    retry = []
     stopped = bool(leaf["first"]) and take(leaf["first"], final=not offs)
     if not stopped:
         for i, off in enumerate(offs):
+            expect = min(WORKDAY_PAGE_SIZE, leaf["K"] - off)   # the last page is legitimately short
             data = _post(url, leaf["applied"], off, company, rep)
-            if not data:
-                retry.append(off)
-                continue
-            jobs = data.get("jobPostings") or []
-            final = i == len(offs) - 1
-            if len(jobs) < min(WORKDAY_PAGE_SIZE, leaf["K"] - off):   # the last page is legitimately short
-                retry.append(off)
-            if take(jobs, final):
+            jobs = list(data.get("jobPostings") or []) if data else []
+            if not data or len(jobs) < expect:
+                # retried here, before the gate sees the page: a short page must not look "all seen"
+                _budget_add(rep, 1)
+                again = _post(url, leaf["applied"], off, company, rep)
+                if again:
+                    seen = {_job_key(p) for p in jobs}
+                    jobs += [p for p in again.get("jobPostings") or [] if _job_key(p) not in seen]
+                elif not data:
+                    rep["failed"] = True
+                    logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
+                                   off, company, leaf["applied"])
+                    continue
+            if take(jobs, i == len(offs) - 1):
                 stopped = True
                 break
-    for off in retry:
-        _budget_add(rep, 1)
-        data = _post(url, leaf["applied"], off, company, rep)
-        if not data:
-            rep["failed"] = True
-            logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
-                           off, company, leaf["applied"])
-            continue
-        for p in data.get("jobPostings") or []:
-            got.setdefault(_job_key(p), p)
     if stopped:
         rep.setdefault("early_leaves", []).append(leaf["applied"])
     if not stopped and len(got) != leaf["K"]:
@@ -519,6 +516,21 @@ def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
         rep["failed"] = True
         logger.warning("workday fetch: request budget used up (%s) — partial result", e)
     return merged, leaf_got
+
+
+def _keep_node_page1(nodes, merged, leaf_got, rep):
+    """A split node's own page 1 (already fetched while planning) holds real jobs, some of which may carry
+    no value for the split facet and so appear in no leaf. Keep them and count them toward the node."""
+    cache = rep.get("node_page1") or {}
+    for node in nodes:
+        page = (cache.get(json.dumps(node["applied"], sort_keys=True)) or {}).get("jobPostings") or []
+        keys = set()
+        for p in page:
+            k = _job_key(p)
+            merged.setdefault(k, p)
+            keys.add(k)
+        if keys:
+            leaf_got.append((dict(node["applied"]), keys))
 
 
 def _node_union(applied, leaf_got):

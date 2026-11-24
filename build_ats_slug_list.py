@@ -522,7 +522,8 @@ def extract_slug(row):
             tenant = fourth.lower()
             wd     = third.lower()
         elif not fourth.strip():
-            if third.lower() in {"jobs", "apply", "www", "community", "wd", "impl", "myworkday"}:
+            from jobs.ats.patterns import WORKDAY_NON_TENANT
+            if third.lower() in WORKDAY_NON_TENANT:
                 return None   # a vendor/system host, not a tenant
             tenant = third.lower()
             wd     = ""

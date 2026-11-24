@@ -273,7 +273,7 @@ def _extract_api_paths(bundle_text):
 # Each takes raw text, returns {"platform": ..., "slug": ...} or None
 # ─────────────────────────────────────────────────────────────────────────────
 
-_WORKDAY_NON_TENANT = frozenset({"jobs", "apply", "www", "community", "wd", "impl", "myworkday"})
+from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
 
 
 def _extract_workday(text):

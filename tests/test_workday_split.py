@@ -123,7 +123,7 @@ def test_gap_inside_tolerance_needs_no_recovery():
     board = _gap_board(8)
     jobs = _run(board)
     assert not any(c.get("searchText") for c in board.calls)
-    assert len(jobs) == 2300 - 8 and jobs.report.complete is True
+    assert len(jobs) == 2300 and jobs.report.complete is True   # the node's own page 1 holds the 8 city-less jobs
 
 
 def test_gap_beyond_tolerance_is_closed_by_the_window():

@@ -14,6 +14,12 @@ import json
 # Each entry: (compiled_regex, platform, slug_extractor_fn)
 # ─────────────────────────────────────────
 
+# Hosts that are Workday aggregator / portal / marketing sites, never a tenant. Only matters for
+# the bare form ({tenant}.myworkdayjobs.com); the wdN form was never ambiguous. Shared by
+# patterns.py, career_detector.py and build_ats_slug_list.py.
+WORKDAY_NON_TENANT = frozenset({"jobs", "apply", "www", "community", "wd", "impl", "myworkday"})
+
+
 def _make_patterns():
     patterns = []
 
@@ -96,14 +102,10 @@ def _make_patterns():
     # We always want the career site name, not the locale prefix.
     _LOCALE_PATTERN = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
 
-    # Hosts that are Workday aggregator / portal / marketing sites, never a tenant. Only matters for
-    # the bare form ({tenant}.myworkdayjobs.com); the wdN form was never ambiguous.
-    _WORKDAY_NON_TENANT = frozenset({"jobs", "apply", "www", "community", "wd", "impl", "myworkday"})
-
     def _workday_slug(m):
         tenant = m.group(1).lower()
         wd     = (m.group(2) or "").lower()   # "" = bare host ({tenant}.myworkdayjobs.com)
-        if not wd and tenant in _WORKDAY_NON_TENANT:
+        if not wd and tenant in WORKDAY_NON_TENANT:
             return None
         raw_path = m.group(3).rstrip("/")
         parts    = [p for p in raw_path.split("/") if p]
@@ -525,14 +527,15 @@ def match_ats_pattern(url):
     url = _decode_google_redirect(url)
 
     for pattern, platform, extractor in ATS_URL_PATTERNS:
-        m = pattern.search(url)
-        if m:
+        # Every match is tried: an earlier one may be rejected (e.g. jobs.myworkdayjobs.com)
+        # while a later one in the same text is a real tenant.
+        for m in pattern.finditer(url):
             try:
                 slug = extractor(m)
-                if slug:
-                    return {"platform": platform, "slug": slug}
             except Exception:
                 continue
+            if slug:
+                return {"platform": platform, "slug": slug}
 
     return None
 
