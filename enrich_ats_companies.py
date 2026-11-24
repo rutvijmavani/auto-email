@@ -22,6 +22,7 @@ import requests
 from datetime import datetime
 
 from logger import get_logger, init_logging
+from jobs.ats.workday import wd_present as workday_wd_present, workday_domain
 from db.schema_discovery import init_discovery_db
 from db.ats_companies import (
     get_unenriched, upsert_company, delete_company
@@ -238,14 +239,15 @@ def enrich_workday(slug):
             return None, "skip"  # plain string — not valid workday slug
 
         tenant  = slug_data.get("slug", "")
-        wd      = slug_data.get("wd", "")
+        wd      = slug_data.get("wd")
         path    = slug_data.get("path", "careers")
 
-        if not tenant or not wd:
+        # "wd" may be "" (bare host); only a missing key / empty tenant is skipped.
+        if not tenant or not workday_wd_present(wd, slug_data.get("site")):
             return None, "skip"
 
         # Try fetching careers page for title
-        url = f"https://{tenant}.{wd}.myworkdayjobs.com/{path}"
+        url = f"{workday_domain(tenant, wd, slug_data.get('site'))}/{path}"
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
                            allow_redirects=True)
 

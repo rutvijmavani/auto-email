@@ -329,8 +329,8 @@ def _build_verify_url(platform, slug):
         try:
             info = json.loads(slug)
             s    = info.get("slug", "")
-            wd   = info.get("wd", "wd5")
-            return f"https://{s}.{wd}.myworkdayjobs.com/careers"
+            from jobs.ats.workday import workday_domain
+            return f"{workday_domain(s, info.get('wd', 'wd5'), info.get('site'))}/careers"
         except (json.JSONDecodeError, TypeError):
             return "#"
 

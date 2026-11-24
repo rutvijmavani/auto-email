@@ -16,7 +16,7 @@ from db.db import init_db, get_conn
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug
 from jobs.ats.base import fetch_json, fetch_json_post
-from jobs.ats.workday import WORKDAY_HEADERS
+from jobs.ats.workday import WORKDAY_HEADERS, workday_domain
 
 init_db()
 
@@ -84,7 +84,7 @@ if atci_with_path:
     job = atci_with_path[0]
     external_path = job["_external_path"]
     detail_url = (
-        f"https://{slug}.{wd}.myworkdayjobs.com"
+        f"{workday_domain(slug, wd)}"
         f"/wday/cxs/{slug}/{path}{external_path}"
     )
     print(f"Detail URL: {detail_url}")
@@ -119,11 +119,11 @@ if r00_with_path:
     job = r00_with_path[0]
     external_path = job["_external_path"]
     detail_url = (
-        f"https://{slug}.{wd}.myworkdayjobs.com"
+        f"{workday_domain(slug, wd)}"
         f"/wday/cxs/{slug}/{path}{external_path}"
     )
     print(f"Detail URL: {detail_url}")
-    print(f"job_id    : {job.get('job_id')}")
+    print(f"job_id   : {job.get('job_id')}")
     print()
 
     raw_data = fetch_json(detail_url, platform="workday", headers=WORKDAY_HEADERS)

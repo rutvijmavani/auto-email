@@ -18,6 +18,7 @@ import json
 
 from config import DISCOVERY_REDETECT, ENRICHMENT_ON_DEMAND
 from db.connection import get_conn
+from jobs.ats import workday
 from jobs.ats.patterns import match_ats_pattern
 from jobs.ats.registry import ATS_REGISTRY, SLUG_REQUIRED_KEYS
 
@@ -56,8 +57,16 @@ def validate_platform_slug(platform: str, slug: str) -> "tuple[str | None, str |
         required = SLUG_REQUIRED_KEYS.get(platform, ())
         if not isinstance(obj, dict):
             return None, f"{platform} slug must be a JSON object."
-        missing = [k for k in required
-                   if not isinstance(obj.get(k), str) or not obj[k].strip()]
+        if platform == "workday":
+            # "wd" may be "" (bare host, nxp.myworkdayjobs.com): the key must exist and be a
+            # string; only myworkdaysite needs a non-empty value (workday.wd_present).
+            missing = [k for k in required if k != "wd"
+                       and (not isinstance(obj.get(k), str) or not obj[k].strip())]
+            if not isinstance(obj.get("wd"), str) or not workday.wd_present(obj["wd"].strip(), obj.get("site")):
+                missing.append("wd")
+        else:
+            missing = [k for k in required
+                       if not isinstance(obj.get(k), str) or not obj[k].strip()]
         if missing:
             # fetch_jobs silently returns [] (or raises) without these — a row saved like
             # that would look enabled but never scan.
