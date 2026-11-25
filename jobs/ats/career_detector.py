@@ -278,16 +278,24 @@ from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
 
 def _extract_workday(text):
     # wd group optional: bare host {tenant}.myworkdayjobs.com is stored as "wd": "".
+    root_only = None   # fallback: a match that names no career site (bare host or locale-only)
     for m in re.finditer(
         r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?::\d+)?(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]+)?)?',
         text, re.IGNORECASE,
     ):
         if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:
             continue   # jobs./apply./www. aggregator hosts are not tenants
-        path = m.group(3) or "careers"   # bare host / empty path: the default site
+        path = m.group(3) or ""
         if re.fullmatch(r'[a-z]{2}[-_][A-Z]{2}', path):
-            path = "careers"   # locale-only URL (e.g. /en-US/): the locale is not the site
+            path = ""   # locale-only URL (e.g. /en-US/): the locale is not the site
+        if not path:
+            if root_only is None:
+                root_only = (m.group(1), m.group(2) or "")
+            continue   # keep scanning: a later link may name the real site
         slug = json.dumps({"slug": m.group(1), "wd": m.group(2) or "", "path": path})
+        return {"platform": "workday", "slug": slug}
+    if root_only:
+        slug = json.dumps({"slug": root_only[0], "wd": root_only[1], "path": "careers"})
         return {"platform": "workday", "slug": slug}
     # alternate myworkdaysite.com domain
     m = re.search(

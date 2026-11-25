@@ -163,6 +163,17 @@ def test_country_filter_is_applied_to_every_request():
     assert all(c.get("appliedFacets") == {"locationCountry": ["us-id"]} for c in board.calls[1:])
 
 
+def test_country_filter_survives_split_window_and_search():
+    # 2500 US jobs (split by fam) + non-US jobs sharing the same fam values
+    rows = (_jobs(1500, locationCountry="us-id", fam="a") + _jobs(1000, 1500, locationCountry="us-id", fam="b")
+            + _jobs(400, 2500, locationCountry="in-id", fam="a"))
+    board = Board(rows, descriptors={"us-id": "United States of America", "in-id": "India"})
+    with patch.object(workday, "WORKDAY_WINDOW_MAX", 0):
+        jobs = _run(board, slug=ACC)
+    assert board.split_calls() and len(_ids(jobs)) == 2500
+    assert all(c.get("appliedFacets", {}).get("locationCountry") == ["us-id"] for c in board.calls[1:])
+
+
 def test_missing_country_value_fetches_nothing():
     board = Board(_jobs(300, locationCountry="x"))
     with patch.object(workday.logger, "error"):
@@ -203,7 +214,7 @@ class _Gate:
 
 
 def test_early_exit_stops_each_leaf_and_skips_recovery():
-    board = _gap_board(100)
+    board = _gap_board(8)
     jobs = _run(board, gate=_Gate())
     assert jobs.report.stop_reason == STOP_EARLY_EXIT
     assert len(jobs) < 2300 and not any(c.get("searchText") for c in board.calls)

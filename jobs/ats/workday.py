@@ -680,6 +680,7 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
             skipped = sum(max(0, k - got) for e, k, got in early
                           if all(e.get(a) == b for a, b in applied.items()))
             have = len(_node_union(applied, leaf_got, merged))
+            have0 = have
             tol = max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL * size)
             if size - have - skipped <= tol:
                 continue
@@ -693,9 +694,13 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
                 after = len(_node_union(applied, leaf_got, merged))
                 logger.info("workday window: %r size=%d unique %d -> %d applied=%s", company, size, have, after, applied)
                 have = after
+            # rows the window found may be the very rows the early leaf skipped: credit only what is still unseen
+            skipped0 = skipped
+            skipped = max(0, skipped0 - (have - have0))
             if size - have - skipped > tol:
                 _search_node(url, node, merged, leaf_got, tol + skipped, company, rep)
                 have = len(_node_union(applied, leaf_got, merged))
+                skipped = max(0, skipped0 - (have - have0))
             if size - have - skipped > tol:
                 rep.setdefault("partial", []).append((applied, size, have))
                 rep["capped"] = True
@@ -898,7 +903,8 @@ def _job_req_id(job, external_path, job_url):
     """
     bullets = [b for b in (job.get("bulletFields") or []) if isinstance(b, str)]
     segment = (external_path or "").rstrip("/").rsplit("/", 1)[-1]
-    token = segment.rsplit("_", 1)[-1].strip() if "_" in segment else ""
+    # only a posting path ("/job/...") carries a requisition token; a site/landing path does not
+    token = segment.rsplit("_", 1)[-1].strip() if "_" in segment and "/job/" in (external_path or "") else ""
     if token:
         base = re.sub(r"-\d+$", "", token)
         for cand in (token, base):
