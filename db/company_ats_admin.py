@@ -15,6 +15,7 @@ Rules (agreed 2026-10-12):
   * A pasted job URL that matches no known pattern writes nothing.
 """
 import json
+from urllib.parse import urlparse
 
 from config import DISCOVERY_REDETECT, ENRICHMENT_ON_DEMAND
 from db.connection import get_conn
@@ -83,6 +84,18 @@ def match_job_url(job_url: str) -> "tuple[dict | None, str | None]":
     if not url.startswith(("http://", "https://")):
         return None, "Paste a full URL starting with https://"
     hit = match_ats_pattern(url)
+    if hit and hit["platform"] == "workday":
+        # The Workday regex scans free text, so a Workday host inside a path or query of some other
+        # site would match. A pasted URL must be on a Workday host itself; its query is ignored.
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+        except ValueError:
+            host = ""
+        if not host.endswith((".myworkdayjobs.com", ".myworkdaysite.com")):
+            hit = None
+        else:
+            hit = match_ats_pattern(f"{parsed.scheme}://{host}{parsed.path}")
     if not hit:
         return None, "That URL does not match any known ATS pattern — nothing was changed."
     _, err = validate_platform_slug(hit["platform"], hit["slug"])

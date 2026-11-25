@@ -252,14 +252,18 @@ def fetch_jobs(slug_info, company, stop_check=None):
 
 def _job_key(posting):
     """Identity of a listing across facet slices: its relative path, else req id, else title+location."""
+    if posting.get("externalPath"):
+        return posting["externalPath"]
     url = posting.get("externalUrl") or ""
     bare = url.split("#", 1)[0].split("?", 1)[0]    # tracking query/fragment must not make one posting two keys
     # board-relative posting path, the same form externalPath has (host, locale and site prefix dropped);
     # only a posting-specific URL counts, a generic one is shared
-    upath = urlparse(bare).path
+    try:
+        upath = urlparse(bare).path
+    except ValueError:   # malformed URL (e.g. "http://[..."): no relative key, fall through
+        upath = ""
     rel = upath[upath.find("/job/"):] if "/job/" in upath else ""
-    return (posting.get("externalPath")
-            or rel
+    return (rel
             or (posting.get("bulletFields") or [""])[0]
             or url
             or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
@@ -545,7 +549,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         e.got = got          # rows already fetched survive the hard stop
         raise
     if stopped:
-        rep.setdefault("early_leaves", []).append(leaf["applied"])
+        rep.setdefault("early_leaves", []).append((leaf["applied"], leaf["K"], len(got)))
     if not stopped and len(got) != leaf["K"]:
         rep.setdefault("leaf_mismatch", []).append((leaf["applied"], leaf["K"], len(got)))
     return got
@@ -665,18 +669,19 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
     Close gaps between a split node's promised count and the unique jobs its leaves returned, deepest
     node first: within tolerance = done; else a direct window (the node's first WORKDAY_RESULT_CAP jobs,
     only for nodes up to WORKDAY_WINDOW_MAX x the cap); else searchText. A node still short is recorded
-    in rep["partial"] and sets rep["capped"]. A node is skipped when a leaf inside it exited early
-    (rep["early_leaves"]: a short leaf is deliberate); other nodes are still recovered.
+    in rep["partial"] and sets rep["capped"]. What an early-exited leaf inside the node skipped on purpose
+    (rep["early_leaves"]: applied, K, got) is not counted as a gap; short sibling leaves still are.
     """
     early = rep.get("early_leaves") or []
     try:
         for node in sorted(nodes, key=lambda n: -n["depth"]):
             applied, size = node["applied"], node["K"]
-            if any(all(e.get(a) == b for a, b in applied.items()) for e in early):
-                continue   # a leaf inside this node exited early on purpose: its shortfall is deliberate
+            # jobs an early-exited leaf inside this node skipped on purpose: not a gap
+            skipped = sum(max(0, k - got) for e, k, got in early
+                          if all(e.get(a) == b for a, b in applied.items()))
             have = len(_node_union(applied, leaf_got, merged))
-            tol =max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL * size)
-            if size - have <= tol:
+            tol = max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL * size)
+            if size - have - skipped <= tol:
                 continue
             if size <= WORKDAY_WINDOW_MAX * WORKDAY_RESULT_CAP:
                 page1 = (rep.get("node_page1") or {}).get(json.dumps(applied, sort_keys=True)) or {}
@@ -688,10 +693,10 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
                 after = len(_node_union(applied, leaf_got, merged))
                 logger.info("workday window: %r size=%d unique %d -> %d applied=%s", company, size, have, after, applied)
                 have = after
-            if size - have > tol:
-                _search_node(url, node, merged, leaf_got, tol, company, rep)
+            if size - have - skipped > tol:
+                _search_node(url, node, merged, leaf_got, tol + skipped, company, rep)
                 have = len(_node_union(applied, leaf_got, merged))
-            if size - have > tol:
+            if size - have - skipped > tol:
                 rep.setdefault("partial", []).append((applied, size, have))
                 rep["capped"] = True
                 logger.warning("workday recover: %r node %s still short after window+search: %d of %d",
