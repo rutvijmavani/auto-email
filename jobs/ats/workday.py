@@ -18,7 +18,7 @@ from config import (
     WORKDAY_SEARCH_MIN_NEW, WORKDAY_SEARCH_STOPWORDS, WORKDAY_SEARCH_TERM_MIN_LEN,
     WORKDAY_WINDOW_MAX,
 )
-from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
+from jobs.ats.base import fetch_json, fetch_json_post, last_post_was_challenge, slugify, validate_company_match
 from jobs.ats.fetch_report import (
     FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
     attach, count_distinct,
@@ -349,7 +349,9 @@ def _post(url, applied, offset, company, rep, text=None):
         body["appliedFacets"] = applied
     if text:
         body["searchText"] = text
-    return fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday")
+    data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday")
+    rep["challenge"] = (not data) and last_post_was_challenge()   # a Cloudflare challenge is not retried
+    return data
 
 
 def _page1(url, applied, company, rep):
@@ -512,6 +514,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
 
     offs = leaf["offs"]
     first = leaf["first"]
+    short = 0   # rows missing from pages that stayed short: a real gap, not rows the gate skipped on purpose
     # a cached page 1 shorter than it should be is not shown to the gate
     stopped = bool(first) and take(first, final=(not offs) or len(first) < min(WORKDAY_PAGE_SIZE, leaf["K"]))
     try:
@@ -522,6 +525,12 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
             data = _post(url, leaf["applied"], off, company, rep)
             jobs = list(data.get("jobPostings") or []) if data else []
             retried = False
+            if not data and rep.get("challenge"):
+                # Cloudflare challenge: the same request can never pass, so no retry; keep what was fetched
+                rep["failed"] = True
+                logger.warning("workday fetch: Cloudflare challenge at offset=%d for %r applied=%s — partial result",
+                               off, company, leaf["applied"])
+                continue
             if not data or len(jobs) < expect:
                 # retried here, before the gate sees the page: a short page must not look "all seen"
                 retried = True
@@ -541,6 +550,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                     logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
                                    off, company, leaf["applied"])
                     continue
+            short += max(0, expect - len(jobs))
             # a page that needed a retry (two responses merged) or is still short keeps its rows but is not gated
             if take(jobs, i == len(offs) - 1 or len(jobs) < expect or retried):
                 stopped = True
@@ -549,7 +559,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         e.got = got          # rows already fetched survive the hard stop
         raise
     if stopped:
-        rep.setdefault("early_leaves", []).append((leaf["applied"], leaf["K"], len(got)))
+        # only the pages never requested count as skipped on purpose; a short page earlier in the leaf stays a gap
+        rep.setdefault("early_leaves", []).append((leaf["applied"], leaf["K"] - short, len(got)))
     if not stopped and len(got) != leaf["K"]:
         rep.setdefault("leaf_mismatch", []).append((leaf["applied"], leaf["K"], len(got)))
     return got
@@ -606,7 +617,7 @@ def _node_union(applied, leaf_got, merged):
     return {k for k in union if (merged.get(k) or {}).get("title")}
 
 
-def _search_node(url, node, merged, leaf_got, tol, company, rep):
+def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
     """
     Last recovery step for a node still short: searchText terms taken from the titles of jobs already
     found inside this node, each searched inside the node. New jobs join `merged` and the node's union.
@@ -619,7 +630,13 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep):
     # a search may spend what the facet would have cost to miss these jobs, no more
     allowance = WORKDAY_GAP_PENALTY * (size - len(have)) / WORKDAY_PAGE_SIZE
     spent = 0
-    while size - len(have) > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and spent < allowance:
+    have0 = len(have)
+
+    def gap():
+        # same rule as _recover: rows an early-exited leaf skipped on purpose are credited only while unseen
+        return size - len(have) - max(0, skipped - (len(have) - have0))
+
+    while gap() > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and spent < allowance:
         words = collections.Counter()
         for k in have:
             title = (merged[k].get("title") or "").lower()
@@ -698,7 +715,7 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
             skipped0 = skipped
             skipped = max(0, skipped0 - (have - have0))
             if size - have - skipped > tol:
-                _search_node(url, node, merged, leaf_got, tol + skipped, company, rep)
+                _search_node(url, node, merged, leaf_got, tol, company, rep, skipped)
                 have = len(_node_union(applied, leaf_got, merged))
                 skipped = max(0, skipped0 - (have - have0))
             if size - have - skipped > tol:

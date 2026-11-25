@@ -96,6 +96,17 @@ def match_job_url(job_url: str) -> "tuple[dict | None, str | None]":
             hit = None
         else:
             hit = match_ats_pattern(f"{parsed.scheme}://{host}{parsed.path}")
+            if hit and hit["platform"] == "workday":
+                # the tenant must come from the host itself, never from a tenant-like string in the path
+                # (myworkdayjobs: first host label = tenant; myworkdaysite: first host label = wd)
+                try:
+                    found = json.loads(hit["slug"])
+                except (TypeError, ValueError):
+                    found = {}
+                label = host.split(".")[0]
+                site = host.endswith(".myworkdaysite.com")
+                if (found.get("wd", "").lower() if site else str(found.get("slug", "")).lower()) != label:
+                    hit = None
     if not hit:
         return None, "That URL does not match any known ATS pattern — nothing was changed."
     _, err = validate_platform_slug(hit["platform"], hit["slug"])

@@ -5,10 +5,20 @@ import time
 import json
 import random
 import logging
+import threading
 import requests
 from config import JOB_MONITOR_API_TIMEOUT, PLATFORM_DELAYS
 
 logger = logging.getLogger(__name__)
+
+# Set by fetch_json_post: True when its last call ended on a Cloudflare challenge (not a rate limit
+# or outage), so a caller can skip a retry that can never succeed. Per thread.
+_post_state = threading.local()
+
+
+def last_post_was_challenge():
+    """True when this thread's last fetch_json_post call stopped on a Cloudflare challenge."""
+    return bool(getattr(_post_state, "challenge", False))
 
 
 # ─────────────────────────────────────────
@@ -147,6 +157,7 @@ def fetch_json_post(url, body=None, retries=2,
         "Content-Type": "application/json",
     }
     request_headers = headers if headers is not None else default_headers
+    _post_state.challenge = False
 
     for attempt in range(retries + 1):
         start_ms    = int(time.time() * 1000)
@@ -178,6 +189,7 @@ def fetch_json_post(url, body=None, retries=2,
                         "Cloudflare challenge (cf-mitigated=%s) on %s (POST) — not retrying",
                         cf_header, platform or url
                     )
+                    _post_state.challenge = True
                     return None
                 # Same single-record rule as fetch_json; Workday (the main
                 # caller) previously recorded no backoff and never ran the
