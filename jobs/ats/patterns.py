@@ -25,6 +25,8 @@ WORKDAY_NON_TENANT = frozenset({
 # markup, or sentence punctuation. Anything else ("fmr+test") means the segment goes on.
 URL_SEGMENT_END = r"""(?=$|[/?#&\s"'<>\\)\]}|`]|[.,;:!](?![a-z0-9]))"""
 
+_SITEMAP_MARKER = r"(?:sitemap[^\s]*\.xml|feed\.xml)"   # what makes a URL a sitemap / XML feed
+
 
 def _make_patterns():
     patterns = []
@@ -419,7 +421,7 @@ def _make_patterns():
     # NOTE: This pattern is intentionally broad — only matched when URL
     # explicitly contains sitemap.xml or feed.xml
     patterns.append((
-        re.compile(r"(https?://[^\s]+(?:sitemap[^\s]*\.xml|feed\.xml))", re.IGNORECASE),
+        re.compile(r"(https?://[^\s]+" + _SITEMAP_MARKER + r")", re.IGNORECASE),
         "sitemap",
         lambda m: json.dumps({"url": m.group(1)}),
     ))
@@ -545,7 +547,8 @@ def match_ats_pattern(url, own_url=False):
     own_url=True: `url` is one pasted link, not free text. Only a match that begins in its own
     scheme/host counts, so a link inside its path or query cannot decide the platform. User
     information ("user@") is dropped first: it is not the host. A "/url?q=" redirect is followed
-    only from a Google origin; a pasted one from any other origin matches nothing.
+    only from a Google origin; a pasted one from any other origin matches nothing. A sitemap is
+    recognised from the link's own path, and keeps its query.
     """
     if not url:
         return None
@@ -584,6 +587,11 @@ def match_ats_pattern(url, own_url=False):
                 bare = bool(slug) and getattr(extractor, "root_only", lambda _m: False)(m)
             except Exception:
                 continue
+            if own_url and platform == "sitemap":
+                # its match always begins at the scheme, so the start limit proves nothing
+                if not re.search(_SITEMAP_MARKER, urlsplit(url).path, re.IGNORECASE):
+                    continue
+                slug = json.dumps({"url": url.split("#", 1)[0]})   # the query may select the feed
             if slug and bare:
                 if root_only is None:
                     root_only = {"platform": platform, "slug": slug}

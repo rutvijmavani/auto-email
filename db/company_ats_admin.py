@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from config import DISCOVERY_REDETECT, ENRICHMENT_ON_DEMAND
 from db.connection import get_conn
 from jobs.ats import workday
-from jobs.ats.patterns import match_ats_pattern
+from jobs.ats.patterns import _decode_google_redirect, match_ats_pattern
 from jobs.ats.registry import ATS_REGISTRY, SLUG_REQUIRED_KEYS
 
 # Platforms that cannot be written from the Discover page.
@@ -88,7 +88,9 @@ def match_job_url(job_url: str) -> "tuple[dict | None, str | None]":
         # The Workday regex scans free text, so a Workday host inside a path or query of some other
         # site would match. A pasted URL must be on a Workday host itself; its query is ignored.
         try:
-            parsed = urlparse(url)
+            # checked on the same URL that was matched: a Google "/url?q=" link stands for its target
+            # (the same shape from any other host matched nothing above)
+            parsed = urlparse(_decode_google_redirect(url))
             host = (parsed.hostname or "").lower()
         except ValueError:
             host = ""

@@ -209,8 +209,8 @@ def fetch_jobs(slug_info, company, stop_check=None):
             return _filter_missing_result(rep)
     leaves, nodes = _plan_board(url, company, rep, base)
     merged, leaf_got = _fetch_leaves(url, leaves, company, rep, gate=stop_check, norm=norm)
-    if rep.get("leaf_mismatch") and not nodes:
-        rep["capped"] = True   # a flat board has no node recovery: rows its leaf lost stay lost
+    if not nodes and any(got < k for _a, k, got in rep.get("leaf_mismatch", [])):
+        rep["capped"] = True   # a flat board has no node recovery: rows its leaf lost stay lost (extra rows lose none)
     _keep_node_page1(nodes, merged, leaf_got, rep)
     if not rep.get("blocked"):   # a Cloudflare challenge ends the scan: no recovery requests
         _recover(url, nodes, merged, leaf_got, company, rep)
@@ -505,7 +505,9 @@ def _plan_board(url, company, rep, base=None):
                     rep["logical"] = rep.get("logical", 0) + 1   # the probe is one request
                 capped = _board_is_capped(url, applied, first, rep, company)
             if not capped:
-                leaves.append(_make_leaf(rep, applied, total, first))
+                leaf = _make_leaf(rep, applied, total, first)
+                leaf["grows"] = depth == 0   # a flat board has no recovery: its leaf follows a total that rises
+                leaves.append(leaf)
                 continue
             cands = _facet_candidates(data.get("facets"), used)
             if size is None:
@@ -547,6 +549,11 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     every non-final page; True ends the leaf and sets rep["early"]. Pages that failed or came back short
     are requested once more; a leaf that still does not match its promised count is recorded in
     rep["leaf_mismatch"] (leaf totals are exact).
+
+    A leaf marked "grows" (the flat board) takes a higher total reported by any of its pages: the new
+    count becomes its promise and rep["reported"], and the extra offsets are paged on the request budget
+    already set. Past WORKDAY_RESULT_CAP that needs a tenant probed as uncapped; otherwise paging stops at
+    the cap and sets rep["capped"]. A total of 0 (later pages often report none) or a lower one is ignored.
     """
     got = {}
     leaf_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
@@ -568,19 +575,34 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
             return True
         return False
 
-    offs = leaf["offs"]
+    offs = list(leaf["offs"])
+    size = leaf["K"]   # the promised count
     first = leaf["first"]
     asked = 0   # offsets of `offs` already requested
+
+    def follow(data):
+        """Raise the promise to a response's higher total, adding the offsets it now needs."""
+        nonlocal size
+        total = (data or {}).get("total") or 0
+        if not leaf.get("grows") or total <= size:
+            return
+        rep["reported"] = total
+        if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is not False:
+            rep["capped"] = True   # offsets past the cap may repeat page 1: page up to it only
+            total = max(size, WORKDAY_RESULT_CAP)
+        size = total
+        offs.extend(range(offs[-1] + WORKDAY_PAGE_SIZE, size, WORKDAY_PAGE_SIZE))
+
     # a cached page 1 shorter than it should be is not shown to the gate
-    stopped = bool(first) and take(first, final=(not offs) or _distinct(first) < min(WORKDAY_PAGE_SIZE, leaf["K"]))
+    stopped = bool(first) and take(first, final=(not offs) or _distinct(first) < min(WORKDAY_PAGE_SIZE, size))
     try:
-        for i, off in enumerate(offs):
+        for i, off in enumerate(offs):   # follow() may append to `offs` while it is walked
             if stopped or rep.get("blocked"):
                 break
             asked = i + 1
-            expect = min(WORKDAY_PAGE_SIZE, leaf["K"] - off)   # the last page is legitimately short
-            final = i == len(offs) - 1
             data = _post(url, leaf["applied"], off, company, rep)
+            follow(data)
+            expect = min(WORKDAY_PAGE_SIZE, size - off)   # the last page is legitimately short
             jobs = list(data.get("jobPostings") or []) if data else []
             retried = False
             if not data and rep.get("challenge"):
@@ -595,6 +617,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                 retried = True
                 _budget_add(rep, 1)
                 again = _post(url, leaf["applied"], off, company, rep)
+                follow(again)
                 if again:
                     pos = {_job_key(p): n for n, p in enumerate(jobs)}
                     for p in again.get("jobPostings") or []:
@@ -609,6 +632,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                     logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
                                    off, company, leaf["applied"])
                     continue
+            final = i == len(offs) - 1   # judged after this page's responses: they may have added offsets
             # a page that needed a retry (two responses merged) or is still short keeps its rows but is not gated
             if take(jobs, final or _distinct(jobs) < expect or retried):
                 stopped = True
@@ -619,10 +643,10 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     if stopped:
         # only the pages never requested count as skipped on purpose; rows lost on a requested page
         # (short, or repeating an earlier one) stay a gap
-        unrequested = sum(min(WORKDAY_PAGE_SIZE, leaf["K"] - o) for o in offs[asked:])
+        unrequested = sum(min(WORKDAY_PAGE_SIZE, size - o) for o in offs[asked:])
         rep.setdefault("early_leaves", []).append((leaf["applied"], len(got) + unrequested, len(got)))
-    if not stopped and len(got) != leaf["K"]:
-        rep.setdefault("leaf_mismatch", []).append((leaf["applied"], leaf["K"], len(got)))
+    if not stopped and len(got) != size:
+        rep.setdefault("leaf_mismatch", []).append((leaf["applied"], size, len(got)))
     return got
 
 
@@ -775,10 +799,12 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
     Close gaps between a split node's promised count and the unique jobs its leaves returned, deepest
     node first: within tolerance = done; else a direct window (the node's first WORKDAY_RESULT_CAP jobs,
     only for nodes up to WORKDAY_WINDOW_MAX x the cap); else searchText. A node still short is recorded
-    in rep["partial"] and sets rep["capped"]. What an early-exited leaf inside the node skipped on purpose
+    in rep["partial"] and sets rep["capped"]; that is judged after the last node, because a parent's rows
+    can give a title to a child's titleless one. What an early-exited leaf inside the node skipped on purpose
     (rep["early_leaves"]: applied, K, got) is not counted as a gap; short sibling leaves still are.
     """
     early = rep.get("early_leaves") or []
+    short = []   # (applied, size, tolerance, skip credit) of nodes short when their turn ended
     try:
         for node in sorted(nodes, key=lambda n: -n["depth"]):
             applied, size = node["applied"], node["K"]
@@ -813,13 +839,17 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
                 have = len(_node_union(applied, leaf_got, merged))
                 skipped = max(0, skipped0 - (have - have0))
             if size - have - skipped > tol:
-                rep.setdefault("partial", []).append((applied, size, have))
-                rep["capped"] = True
-                logger.warning("workday recover: %r node %s still short after window+search: %d of %d",
-                               company, applied, have, size)
+                short.append((applied, size, tol, skipped))
     except _OverBudget as e:
         rep["failed"] = True
         logger.warning("workday recover: request budget used up (%s) — partial result", e)
+    for applied, size, tol, skipped in short:
+        have = len(_node_union(applied, leaf_got, merged))   # titles gained since the node's turn count
+        if size - have - skipped > tol:
+            rep.setdefault("partial", []).append((applied, size, have))
+            rep["capped"] = True
+            logger.warning("workday recover: %r node %s still short after window+search: %d of %d",
+                           company, applied, have, size)
 
 
 def fetch_job_detail(job):
