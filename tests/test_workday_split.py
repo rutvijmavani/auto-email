@@ -1,6 +1,8 @@
 """Tests for the Workday planner in jobs/ats/workday.py — a fake board stands in for fetch_json_post (no network)."""
 from unittest.mock import patch
 
+import pytest
+
 from jobs.ats import workday
 from jobs.ats.fetch_report import STOP_EARLY_EXIT, STOP_NO_CONFIG, STOP_REQUEST_FAILED
 
@@ -163,15 +165,24 @@ def test_country_filter_is_applied_to_every_request():
     assert all(c.get("appliedFacets") == {"locationCountry": ["us-id"]} for c in board.calls[1:])
 
 
-def test_country_filter_survives_split_window_and_search():
-    # 2500 US jobs (split by fam) + non-US jobs sharing the same fam values
-    rows = (_jobs(1500, locationCountry="us-id", fam="a") + _jobs(1000, 1500, locationCountry="us-id", fam="b")
-            + _jobs(400, 2500, locationCountry="in-id", fam="a"))
+@pytest.mark.parametrize("window_max, by_search", [(workday.WORKDAY_WINDOW_MAX, False), (0, True)],
+                         ids=["window", "search"])
+def test_country_filter_survives_split_and_recovery(window_max, by_search):
+    # 2300 US jobs, 100 of them without the split facet (recovery needed) + non-US jobs sharing facet values
+    rows = _gap_board(100).jobs
+    for j in rows:
+        j["attrs"]["locationCountry"] = "us-id"
+    rows += _jobs(400, 2300, locationCountry="in-id", fam="a", city="C0")
     board = Board(rows, descriptors={"us-id": "United States of America", "in-id": "India"})
-    with patch.object(workday, "WORKDAY_WINDOW_MAX", 0):
+    with patch.object(workday, "WORKDAY_WINDOW_MAX", window_max):
         jobs = _run(board, slug=ACC)
-    assert board.split_calls() and len(_ids(jobs)) == 2500
+    us_only = {"locationCountry": ["us-id"]}
+    node = [c for c in board.calls if c.get("appliedFacets") == us_only]   # the split node's own query
+    window = [c for c in node if not c.get("searchText") and 0 < c["offset"] < 2000]
+    search = [c for c in node if c.get("searchText")]
+    assert board.split_calls() and bool(search) is by_search and bool(window) is not by_search
     assert all(c.get("appliedFacets", {}).get("locationCountry") == ["us-id"] for c in board.calls[1:])
+    assert _ids(jobs) == {f"R-{i}" for i in range(2300)}
 
 
 def test_missing_country_value_fetches_nothing():

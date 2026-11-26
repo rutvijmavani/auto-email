@@ -294,14 +294,21 @@ def _extract_workday(text):
             continue   # keep scanning: a later link may name the real site
         slug = json.dumps({"slug": m.group(1), "wd": m.group(2) or "", "path": path})
         return {"platform": "workday", "slug": slug}
-    # alternate myworkdaysite.com domain: names its site, so it beats a root-only myworkdayjobs match
-    m = re.search(
-        r'(wd\d+)\.myworkdaysite\.com/recruiting/([a-z0-9-]+)/([a-zA-Z0-9_%-]*)',
+    # alternate myworkdaysite.com domain: beats a root-only myworkdayjobs match
+    alt_root_only = None   # alternate-domain match that names no site: used if no later one names it
+    for m in re.finditer(
+        r'(wd\d+)\.myworkdaysite\.com/recruiting/([a-z0-9-]+)/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*)',
         text, re.IGNORECASE,
-    )
-    if m:
-        slug = json.dumps({"slug": m.group(2), "wd": m.group(1), "path": m.group(3)})
-        return {"platform": "workday", "slug": slug}
+    ):
+        path = m.group(3)
+        if re.fullmatch(r'[a-z]{2}[-_][A-Z]{2}', path):
+            path = ""   # locale-only URL: the locale is not the site
+        info = {"slug": m.group(2), "wd": m.group(1), "path": path or "careers", "site": "myworkdaysite"}
+        if path:
+            return {"platform": "workday", "slug": json.dumps(info)}
+        alt_root_only = alt_root_only or info
+    if alt_root_only:
+        return {"platform": "workday", "slug": json.dumps(alt_root_only)}
     if root_only:
         slug = json.dumps({"slug": root_only[0], "wd": root_only[1], "path": "careers"})
         return {"platform": "workday", "slug": slug}

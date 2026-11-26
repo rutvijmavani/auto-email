@@ -299,6 +299,9 @@ def _board_is_capped(url, applied, first_jobs, rep, company):
                        WORKDAY_RESULT_CAP, company)
         return True
     probe_jobs = data.get("jobPostings") or []
+    if rep is not None:
+        # real rows of this query: kept for the result even if the scan stops before paging reaches them
+        rep.setdefault("probe_rows", []).append((dict(applied or {}), probe_jobs))
     # capped = the probe page repeats page 1 (at least half of it); one shared key is not a repeat
     capped = bool(probe_jobs) and bool(first_keys) \
         and 2 * len(first_keys & {_job_key(p) for p in probe_jobs}) >= len(first_keys)
@@ -415,11 +418,16 @@ def _choose_facet(cands, size):
     return ranked[0] if ranked else None
 
 
+def _distinct(rows):
+    """Number of different postings in a page: a repeated row does not fill the window."""
+    return len({_job_key(p) for p in rows})
+
+
 def _make_leaf(rep, applied, size, first=None):
     """A query below the cap that is paged to its end. `first` = page 1 when already fetched."""
     first = list(first or [])
     # a cached page 1 that came back short is fetched again from offset 0; a full one costs no request
-    start = len(first) if len(first) >= min(WORKDAY_PAGE_SIZE, size) else 0
+    start = len(first) if _distinct(first) >= min(WORKDAY_PAGE_SIZE, size) else 0
     offs = list(range(start, size, WORKDAY_PAGE_SIZE))
     _budget_add(rep, len(offs))
     return {"applied": applied, "K": size, "first": first, "offs": offs}
@@ -528,12 +536,15 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     first = leaf["first"]
     short = 0   # rows missing from pages that stayed short: a real gap, not rows the gate skipped on purpose
     # a cached page 1 shorter than it should be is not shown to the gate
-    stopped = bool(first) and take(first, final=(not offs) or len(first) < min(WORKDAY_PAGE_SIZE, leaf["K"]))
+    stopped = bool(first) and take(first, final=(not offs) or _distinct(first) < min(WORKDAY_PAGE_SIZE, leaf["K"]))
     try:
         for i, off in enumerate(offs):
             if stopped or rep.get("blocked"):
                 break
             expect = min(WORKDAY_PAGE_SIZE, leaf["K"] - off)   # the last page is legitimately short
+            final = i == len(offs) - 1
+            # before the end a repeated row hides a missing one; the last page is checked by the leaf total
+            filled = len if final else _distinct
             data = _post(url, leaf["applied"], off, company, rep)
             jobs = list(data.get("jobPostings") or []) if data else []
             retried = False
@@ -543,7 +554,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                 logger.warning("workday fetch: Cloudflare challenge at offset=%d for %r applied=%s — scan stopped, partial result",
                                off, company, leaf["applied"])
                 break
-            if not data or len(jobs) < expect:
+            if not data or filled(jobs) < expect:
                 # retried here, before the gate sees the page: a short page must not look "all seen"
                 retried = True
                 _budget_add(rep, 1)
@@ -562,9 +573,9 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                     logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
                                    off, company, leaf["applied"])
                     continue
-            short += max(0, expect - len(jobs))
+            short += max(0, expect - filled(jobs))
             # a page that needed a retry (two responses merged) or is still short keeps its rows but is not gated
-            if take(jobs, i == len(offs) - 1 or len(jobs) < expect or retried):
+            if take(jobs, final or filled(jobs) < expect or retried):
                 stopped = True
                 break
     except _OverBudget as e:
@@ -612,17 +623,19 @@ def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
 
 def _keep_node_page1(nodes, merged, leaf_got, rep):
     """A split node's own page 1 (already fetched while planning) holds real jobs, some of which may carry
-    no value for the split facet and so appear in no leaf. Keep them and count them toward the node."""
+    no value for the split facet and so appear in no leaf. Keep them and count them toward the node.
+    The cap probe's page (rep["probe_rows"]) is kept the same way, under the filters it was asked with."""
     cache = rep.get("node_page1") or {}
-    for node in nodes:
-        page = (cache.get(json.dumps(node["applied"], sort_keys=True)) or {}).get("jobPostings") or []
+    pages = [(node["applied"], (cache.get(json.dumps(node["applied"], sort_keys=True)) or {}).get("jobPostings") or [])
+             for node in nodes]
+    for applied, page in pages + (rep.get("probe_rows") or []):
         keys = set()
         for p in page:
             k = _job_key(p)
             _merge_row(merged, k, p)
             keys.add(k)
         if keys:
-            leaf_got.append((dict(node["applied"]), keys))
+            leaf_got.append((dict(applied), keys))
 
 
 def _node_union(applied, leaf_got, merged):
@@ -654,7 +667,7 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
         # same rule as _recover: rows an early-exited leaf skipped on purpose are credited only while unseen
         return size - len(have) - max(0, skipped - (len(have) - have0))
 
-    while not rep.get("blocked") and gap() > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and spent < allowance:
+    while not rep.get("blocked") and gap() > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and allowance - spent >= 1:
         words = collections.Counter()
         for k in have:
             title = (merged[k].get("title") or "").lower()
@@ -666,11 +679,12 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
         term = words.most_common(1)[0][0]
         tried.add(term)
         new, off, ended = {}, 0, False
-        while off < WORKDAY_RESULT_CAP and not ended and spent < allowance:
-            _budget_add(rep, WORKDAY_SEARCH_CHUNK_PAGES)
-            spent += WORKDAY_SEARCH_CHUNK_PAGES
+        while off < WORKDAY_RESULT_CAP and not ended and allowance - spent >= 1:
+            chunk = min(WORKDAY_SEARCH_CHUNK_PAGES, int(allowance - spent))   # never past the allowance
+            _budget_add(rep, chunk)
+            spent += chunk
             rows = fresh = 0
-            end = min(off + WORKDAY_SEARCH_CHUNK_PAGES * WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP)
+            end = min(off + chunk * WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP)
             for o in range(off, end, WORKDAY_PAGE_SIZE):
                 data = _post(url, applied, o, company, rep, text=term)
                 jobs = (data or {}).get("jobPostings") or []

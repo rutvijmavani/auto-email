@@ -232,9 +232,10 @@ elif [[ -n "$_missing_wrappers" ]] || [[ -f "$_CRON_PENDING_FLAG" ]]; then
     else
         echo "  setup_cron.sh changed in this deploy — regenerating wrappers"
     fi
+    # set before the call: a setup_cron.sh that fails part-way may already have replaced some wrappers
+    _CRON_REGENERATED=true   # a later rollback re-runs the old setup_cron.sh
     if bash "$PROJECT_DIR/setup_cron.sh"; then
         rm -f "$_CRON_PENDING_FLAG"
-        _CRON_REGENERATED=true   # a later rollback re-runs the old setup_cron.sh
         echo "  Cron wrappers regenerated."
     else
         echo "  [WARN] setup_cron.sh failed — cron jobs may not run; fix manually"

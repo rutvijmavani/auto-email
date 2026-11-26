@@ -595,6 +595,11 @@ def extract_slug(row):
     return None
 
 
+def _read_athena_csv(path):
+    """Cached/--from-csv Athena rows as text: a host label "null" or "na" is a name, not a missing value."""
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
 def process_dataframe(df, crawl_id):
     """
     Extract all slugs from Athena result DataFrame.
@@ -1062,11 +1067,11 @@ def main():
         if args.from_csv and os.path.exists(args.from_csv):
             logger.info("Loading from CSV: %s", args.from_csv)
             print(f"  [CSV] Loading from {args.from_csv}")
-            df = pd.read_csv(args.from_csv)
+            df = _read_athena_csv(args.from_csv)
         elif os.path.exists(csv_path) and not args.test:
             logger.info("Found existing CSV: %s", csv_path)
             print(f"  [CSV] Found existing: {csv_path}")
-            df = pd.read_csv(csv_path)
+            df = _read_athena_csv(csv_path)
         elif args.test:
             logger.info("Test mode: skipping Athena for %s", crawl_id)
             print(f"  [TEST] Skipping Athena for {crawl_id}")

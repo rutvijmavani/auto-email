@@ -157,6 +157,13 @@ def _make_patterns():
             "site": "myworkdaysite",  # flag different base URL
         })
 
+    def _workdaysite_root_only(m):
+        """True when the match names no career site (nothing or only a locale after the tenant)."""
+        parts = [p for p in m.group(3).split("/") if p]
+        return not any(not _LOCALE_PATTERN2.match(p) for p in parts)
+
+    _workdaysite_slug.root_only = _workdaysite_root_only
+
     patterns.append((
         re.compile(
             r"(wd\d+)\.myworkdaysite\.com/"
