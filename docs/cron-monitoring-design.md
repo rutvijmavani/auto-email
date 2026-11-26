@@ -18,6 +18,10 @@ Implementation deviations from the text below:
 - `CRON_WATCH_IGNORE_PATTERNS` is `;;`-separated, not comma-separated, so regexes can contain commas.
 - Missing-wrapper alert fires immediately (not only when a slot is due).
 - A watcher crash emails once per re-alert window (flag file `data/cron_watch_error.flag`).
+- Deploy self-heal is wider than decision 10.5: `deploy.sh` also reruns `setup_cron.sh` when a pull changed that file
+  (pending flag `data/.cron_regen_pending`, kept until the rerun succeeds), and a rollback after a rerun runs the old
+  `setup_cron.sh` again. The first deploy that brings this check is executed by the older `deploy.sh`, so it needs one
+  manual `bash setup_cron.sh`.
 
 ## 1. Why this exists (the incident)
 

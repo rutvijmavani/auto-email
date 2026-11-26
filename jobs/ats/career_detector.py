@@ -299,7 +299,8 @@ def _extract_workday(text):
     alt_root_only = None   # alternate-domain match that names no site: used if no later one names it
     for m in re.finditer(
         # the locale may sit before /recruiting/ or after the tenant
-        r'(wd\d+)\.myworkdaysite\.com/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)'
+        # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
+        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)'
         + _URL_SEGMENT_END +   # the whole tenant segment; the URL may end right after it
         r'(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*))?',
         text, re.IGNORECASE,

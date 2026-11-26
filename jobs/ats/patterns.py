@@ -17,7 +17,9 @@ import json
 # Hosts that are Workday aggregator / portal / marketing sites, never a tenant. Only matters for
 # the bare form ({tenant}.myworkdayjobs.com); the wdN form was never ambiguous. Shared by
 # patterns.py, career_detector.py and build_ats_slug_list.py.
-WORKDAY_NON_TENANT = frozenset({"jobs", "apply", "www", "community", "wd", "impl", "myworkday"})
+WORKDAY_NON_TENANT = frozenset({
+    "jobs", "apply", "www", "careers", "secure", "community", "wd", "impl", "myworkday",
+})
 
 # What may follow a whole URL path segment: the end, the next URL part, what closes a link in text or
 # markup, or sentence punctuation. Anything else ("fmr+test") means the segment goes on.
@@ -170,7 +172,8 @@ def _make_patterns():
 
     patterns.append((
         re.compile(
-            r"(wd\d+)\.myworkdaysite\.com/"
+            # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
+            r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com/"
             r"(?:[a-z]{2}[-_][A-Z]{2}/)?"   # optional locale: en-US, fr-FR, pt_BR
             r"recruiting/([a-z0-9-]+)" + URL_SEGMENT_END +   # the whole tenant segment
             r"(?:/([^?&#\s\"'<>]*))?",   # the site part is optional: the URL may end at the tenant

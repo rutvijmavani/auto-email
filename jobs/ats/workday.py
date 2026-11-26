@@ -477,6 +477,8 @@ def _plan_board(url, company, rep, base=None):
                 continue
             total = data.get("total", 0) or 0
             first = data.get("jobPostings") or []
+            if depth == 0:
+                rep["reported"] = total   # recorded before the retry below, which may skip the board
             if total > 0 and not first:
                 # an empty page 1 must not decide flat vs split: ask once more
                 _budget_add(rep, 1)
@@ -738,9 +740,9 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
                         rows += 1
                         k = _job_key(p)
                         if not p.get("title"):
-                            if k not in merged:
-                                merged[k] = p   # kept so a later titled copy can replace it; closes no gap
-                        elif k not in have and k not in new:
+                            # kept so a later titled copy can replace it; a copy already titled counts
+                            p = merged.setdefault(k, p)
+                        if p.get("title") and k not in have and k not in new:
                             new[k] = p
                             fresh += 1
                     if gap(len(new)) <= tol:

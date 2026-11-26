@@ -195,6 +195,9 @@ def get_recent_crawls(n=CRAWLS_TO_USE):
 
 # Bump whenever MAIN_QUERY changes: it is part of the cached CSV name, so rows produced by an older
 # query are never reused as the current result (q2 = Workday bare hosts added).
+# Forward-only: it does not reopen crawls already in scanned_crawls, so a changed query first runs on
+# the next new crawl. To rescan by hand, delete only the NEWEST crawl's scanned_crawls row: rescanning
+# older ones would move last_seen_crawl back (bulk_insert_slugs overwrites it, newest is done first).
 ATHENA_QUERY_REV = "q2"
 
 MAIN_QUERY = """
@@ -541,6 +544,8 @@ def extract_slug(row):
         elif re.match(r'^wd[0-9]+$', third, re.IGNORECASE):
             tenant = fourth.lower()
             wd     = third.lower()
+            if tenant in EXCLUDED_SLUGS:
+                return None
         else:
             return None  # skip non-WD subdomains
         # Extract path — skip locale prefix (en-US, en-GB, fr-FR etc.)
@@ -556,7 +561,7 @@ def extract_slug(row):
                 path_ = part
                 break  # first non-locale segment is the career site name
 
-        if not tenant or tenant in EXCLUDED_SLUGS:
+        if not tenant:
             return None
         # Validate path_ — reject URL delimiters or scheme patterns
         if (path_ and (
