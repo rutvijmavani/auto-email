@@ -83,7 +83,7 @@ def match_job_url(job_url: str) -> "tuple[dict | None, str | None]":
     url = (job_url or "").strip()
     if not url.startswith(("http://", "https://")):
         return None, "Paste a full URL starting with https://"
-    hit = match_ats_pattern(url)
+    hit = match_ats_pattern(url, own_url=True)   # an ATS link in the path/query never counts
     if hit and hit["platform"] == "workday":
         # The Workday regex scans free text, so a Workday host inside a path or query of some other
         # site would match. A pasted URL must be on a Workday host itself; its query is ignored.

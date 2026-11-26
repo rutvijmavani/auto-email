@@ -168,7 +168,7 @@ def _make_patterns():
         re.compile(
             r"(wd\d+)\.myworkdaysite\.com/"
             r"(?:[a-z]{2}[-_][A-Z]{2}/)?"   # optional locale: en-US, fr-FR, pt_BR
-            r"recruiting/([a-z0-9]+)/([^?&#\s\"'<>]*)",
+            r"recruiting/([a-z0-9-]+)/([^?&#\s\"'<>]*)",
             re.IGNORECASE
         ),
         "workday",
@@ -529,10 +529,13 @@ def get_slug_keywords(company):
     return all_kw
 
 
-def match_ats_pattern(url):
+def match_ats_pattern(url, own_url=False):
     """
     Try all ATS URL patterns against a URL.
     Returns {platform, slug} or None.
+
+    own_url=True: `url` is one pasted link, not free text. Only a match that begins in its own
+    scheme/host counts, so a link inside its path or query cannot decide the platform.
     """
     if not url:
         return None
@@ -540,11 +543,22 @@ def match_ats_pattern(url):
     # Decode Google redirect URLs
     url = _decode_google_redirect(url)
 
+    start_limit = len(url)   # matches must start before this index
+    if own_url:
+        from urllib.parse import urlsplit
+        try:
+            netloc = urlsplit(url).netloc
+        except ValueError:
+            return None
+        start_limit = url.find(netloc) + len(netloc)
+
     root_only = None   # a workday match that names no career site: kept while an explicit site is looked for
     for pattern, platform, extractor in ATS_URL_PATTERNS:
         # Every match is tried: an earlier one may be rejected (e.g. jobs.myworkdayjobs.com)
         # while a later one in the same text is a real tenant.
         for m in pattern.finditer(url):
+            if m.start() >= start_limit:
+                break
             try:
                 slug = extractor(m)
                 bare = bool(slug) and getattr(extractor, "root_only", lambda _m: False)(m)

@@ -242,7 +242,8 @@ def test_gate_never_sees_the_capped_unsplit_query():
             seen.append(len(jobs))
             return False
     _run(Board(_jobs(1500, fam="eng") + _jobs(800, 1500, fam="sales")), gate=Spy())
-    assert seen and max(seen) <= PAGE   # only leaf pages; the 2000-job unsplit page 1 is not gated separately
+    # one call per non-final leaf page (74 eng + 39 sales); the capped unsplit page 1 adds none
+    assert len(seen) == 74 + 39 and max(seen) <= PAGE
 
 
 def test_request_budget_is_a_hard_stop():

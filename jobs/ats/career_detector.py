@@ -297,7 +297,9 @@ def _extract_workday(text):
     # alternate myworkdaysite.com domain: beats a root-only myworkdayjobs match
     alt_root_only = None   # alternate-domain match that names no site: used if no later one names it
     for m in re.finditer(
-        r'(wd\d+)\.myworkdaysite\.com/recruiting/([a-z0-9-]+)/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*)',
+        # the locale may sit before /recruiting/ or after the tenant
+        r'(wd\d+)\.myworkdaysite\.com/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)/'
+        r'(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*)',
         text, re.IGNORECASE,
     ):
         path = m.group(3)

@@ -167,15 +167,20 @@ if [[ "$BEHIND" == "0" ]]; then
         exit 0
     fi
 else
-    git pull origin "${_BRANCH}"
     # The run_*.sh wrappers are generated from setup_cron.sh and are not in git, so a changed
     # setup_cron.sh does not reach them on its own (the VM ran a stale run_monthly.sh for a week).
     # Persisted in a flag file so a failed regeneration (or an aborted deploy) is retried by the next deploy,
     # even when that one pulls nothing; cleared only after setup_cron.sh succeeds.
+    # Checked BEFORE the pull: a deploy interrupted after the pull would leave nothing to detect next time.
+    if ! git diff --quiet HEAD "origin/${_BRANCH}" -- setup_cron.sh; then
+        mkdir -p "$PROJECT_DIR/data" && touch "$_CRON_PENDING_FLAG"
+    fi
+    git pull origin "${_BRANCH}"
+    # again after the pull: it can bring commits pushed since the fetch above
     if ! git diff --quiet "$PREVIOUS_SHA" HEAD -- setup_cron.sh; then
         mkdir -p "$PROJECT_DIR/data" && touch "$_CRON_PENDING_FLAG"
     fi
-    NEW_SHA=$(git rev-parse --short HEAD)   # (flag handling above)
+    NEW_SHA=$(git rev-parse --short HEAD)
     echo "  Updated to : $NEW_SHA"
     echo ""
     echo "► Recent changes:"

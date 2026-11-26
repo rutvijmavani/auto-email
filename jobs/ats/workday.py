@@ -257,14 +257,21 @@ def _job_key(posting):
         return posting["externalPath"]
     url = posting.get("externalUrl") or ""
     bare = url.split("#", 1)[0].split("?", 1)[0]    # tracking query/fragment must not make one posting two keys
-    # board-relative posting path, the same form externalPath has (host, locale and site prefix dropped);
-    # only a posting-specific URL counts, a generic one is shared
+    # only a posting-specific URL counts, a generic one is shared. A "/job/" URL keys by its
+    # board-relative path, the form externalPath has (host, locale and site prefix dropped); a legacy URL
+    # ending in a posting id (".../1", "..._R-12") keys by the whole URL
     try:
         upath = urlparse(bare).path
-    except ValueError:   # malformed URL (e.g. "http://[..."): no relative key, fall through
+    except ValueError:   # malformed URL (e.g. "http://[..."): not posting-specific, fall through
         upath = ""
-    rel = upath[upath.find("/job/"):] if "/job/" in upath else ""
-    return (rel
+    last = upath.rstrip("/").rsplit("/", 1)[-1]
+    if "/job/" in upath:
+        own = upath[upath.find("/job/"):]
+    elif last.isdigit() or re.search(r"_(?:JR|R)-?\d+(?:-\d+)?$", last):
+        own = bare
+    else:
+        own = ""
+    return (own
             or (posting.get("bulletFields") or [""])[0]
             or url
             or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
@@ -543,8 +550,6 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                 break
             expect = min(WORKDAY_PAGE_SIZE, leaf["K"] - off)   # the last page is legitimately short
             final = i == len(offs) - 1
-            # before the end a repeated row hides a missing one; the last page is checked by the leaf total
-            filled = len if final else _distinct
             data = _post(url, leaf["applied"], off, company, rep)
             jobs = list(data.get("jobPostings") or []) if data else []
             retried = False
@@ -554,7 +559,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                 logger.warning("workday fetch: Cloudflare challenge at offset=%d for %r applied=%s — scan stopped, partial result",
                                off, company, leaf["applied"])
                 break
-            if not data or filled(jobs) < expect:
+            # distinct rows, on every page: a repeated row hides a missing one
+            if not data or _distinct(jobs) < expect:
                 # retried here, before the gate sees the page: a short page must not look "all seen"
                 retried = True
                 _budget_add(rep, 1)
@@ -573,9 +579,9 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                     logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
                                    off, company, leaf["applied"])
                     continue
-            short += max(0, expect - filled(jobs))
+            short += max(0, expect - _distinct(jobs))
             # a page that needed a retry (two responses merged) or is still short keeps its rows but is not gated
-            if take(jobs, final or filled(jobs) < expect or retried):
+            if take(jobs, final or _distinct(jobs) < expect or retried):
                 stopped = True
                 break
     except _OverBudget as e:
@@ -682,11 +688,11 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
         while off < WORKDAY_RESULT_CAP and not ended and allowance - spent >= 1:
             chunk = min(WORKDAY_SEARCH_CHUNK_PAGES, int(allowance - spent))   # never past the allowance
             _budget_add(rep, chunk)
-            spent += chunk
             rows = fresh = 0
             end = min(off + chunk * WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP)
             for o in range(off, end, WORKDAY_PAGE_SIZE):
                 data = _post(url, applied, o, company, rep, text=term)
+                spent += 1   # only requests actually sent: a chunk can end early
                 jobs = (data or {}).get("jobPostings") or []
                 if not jobs:
                     ended = True
@@ -1015,9 +1021,16 @@ def _normalize(job, company, domain, path, slug_info=None):
     # the careers homepage), derive external_path from it so fetch_job_detail()
     # can build the CXS detail endpoint.  This handles tenants that omit the
     # relative-path field but return an absolute job URL.
+    _si = slug_info or {}
+    _is_site = _si.get("site") == "myworkdaysite"
     if not external_path and external_url and external_url.startswith("http"):
-        from urllib.parse import urlparse as _urlparse
-        _parsed_path = _urlparse(external_url).path  # e.g. "/en-US/NVIDIAExternalCareerSite/job/Loc/Title_R-1"
+        try:
+            # e.g. "/en-US/NVIDIAExternalCareerSite/job/Loc/Title_R-1"
+            _parsed_path = urlparse(external_url).path
+        except ValueError:   # malformed URL (e.g. "http://[..."): treated as no URL at all
+            external_url = _parsed_path = ""
+        if _is_site:   # drop "/recruiting/{tenant}" first: a site named like the tenant must not match it
+            _parsed_path = re.sub(r"^.*?/recruiting/[^/]+", "", _parsed_path)
         _path_prefix = "/" + path.strip("/")          # e.g. "/NVIDIAExternalCareerSite"
         # Use find so locale-prefixed URLs (e.g. /en-US/NVIDIAExternalCareerSite/...)
         # are handled the same as unprefixed ones (/NVIDIAExternalCareerSite/...).
@@ -1025,20 +1038,25 @@ def _normalize(job, company, domain, path, slug_info=None):
         if _path_idx != -1:
             external_path = _parsed_path[_path_idx + len(_path_prefix):]  # e.g. "/job/Loc/Title_R-1"
 
+    # public career site root; myworkdaysite pages live under /recruiting/{tenant}/ (the CXS API does not)
+    site_root = domain.rstrip("/")
+    if _is_site:
+        site_root += "/recruiting/" + _si.get("slug", "")
+    site_root += "/" + path.strip("/")
+
     if external_path:
-        # Relative path from real Workday API — prepend domain + career site name
-        job_url = domain.rstrip("/") + "/" + path.strip("/") + "/" + external_path.lstrip("/")
+        # Relative path from real Workday API — prepend the career site root
+        job_url = site_root + "/" + external_path.lstrip("/")
     elif external_url and external_url.startswith("http"):
         # Absolute URL provided directly (legacy/test data)
         job_url = external_url
     else:
-        # Neither field present — build a best-effort fallback from domain + path
+        # Neither field present — fall back to the career site root
         # so we never silently drop a job with a valid title
-        job_url = domain.rstrip("/") + "/" + path.strip("/")
+        job_url = site_root
 
     _bullet_id = _job_req_id(job, external_path, job_url)
 
-    _si = slug_info or {}
     return {
         "company":        company,
         "title":          job.get("title", ""),
