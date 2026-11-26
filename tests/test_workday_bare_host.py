@@ -56,6 +56,20 @@ class TestDetailGuard(unittest.TestCase):
         self.assertEqual(fj.call_args.args[0],
                          "https://nxp.myworkdayjobs.com/wday/cxs/nxp/careers/job/x_1")
 
+    def test_stored_bare_host_slug_reaches_the_detail_request(self):
+        # URL -> stored slug -> normalized listing -> detail request, nothing built by hand
+        import json
+        from jobs.ats.patterns import match_ats_pattern
+        hit = match_ats_pattern("https://nxp.myworkdayjobs.com/careers/job/x_R-1")
+        slug_info = json.loads(hit["slug"])
+        self.assertEqual(slug_info["wd"], "")
+        posting = {"title": "Engineer", "externalPath": "/job/x_R-1", "bulletFields": ["R-1"]}
+        job = workday._normalize(posting, "NXP", workday._build_domain(slug_info), slug_info["path"], slug_info)
+        with patch.object(workday, "fetch_json", return_value={}) as fj:
+            workday.fetch_job_detail(job)
+        self.assertEqual(fj.call_args.args[0],
+                         "https://nxp.myworkdayjobs.com/wday/cxs/nxp/careers/job/x_R-1")
+
     def test_missing_wd_key_skips_request(self):
         job = self._job()
         del job["_wd"]

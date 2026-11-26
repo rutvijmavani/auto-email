@@ -212,7 +212,8 @@ def fetch_jobs(slug_info, company, stop_check=None):
     if rep.get("leaf_mismatch") and not nodes:
         rep["capped"] = True   # a flat board has no node recovery: rows its leaf lost stay lost
     _keep_node_page1(nodes, merged, leaf_got, rep)
-    _recover(url, nodes, merged, leaf_got, company, rep)
+    if not rep.get("blocked"):   # a Cloudflare challenge ends the scan: no recovery requests
+        _recover(url, nodes, merged, leaf_got, company, rep)
     all_jobs = list(merged.values())
 
     results = []
@@ -292,6 +293,8 @@ def _board_is_capped(url, applied, first_jobs, rep, company):
     if rep is not None:
         rep["pages"] += 1
     if not data:
+        if rep is not None and last_post_was_challenge():
+            rep["blocked"] = rep["failed"] = True
         logger.warning("workday fetch: cap probe at offset=%d failed for %r — treating board as capped",
                        WORKDAY_RESULT_CAP, company)
         return True
@@ -338,7 +341,10 @@ def _budget_add(rep, cost):
 
 
 def _post(url, applied, offset, company, rep, text=None):
-    """One list request, counted against the budget. Raises _OverBudget past it; returns the JSON or None."""
+    """One list request, counted against the budget. Raises _OverBudget past it; returns the JSON or None.
+    After a Cloudflare challenge nothing more is sent (None)."""
+    if rep.get("blocked"):
+        return None
     if rep.get("logical", 0) >= rep.get("budget", 0.0):
         rep["over_budget"] = True
         raise _OverBudget(f"{company}: {rep.get('logical', 0)} requests >= budget {rep.get('budget', 0.0):.0f}")
@@ -351,6 +357,9 @@ def _post(url, applied, offset, company, rep, text=None):
         body["searchText"] = text
     data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday")
     rep["challenge"] = (not data) and last_post_was_challenge()   # a Cloudflare challenge is not retried
+    if rep["challenge"]:
+        # the whole scan stops: no more pages, sibling leaves or recovery
+        rep["blocked"] = rep["failed"] = True
     return data
 
 
@@ -434,6 +443,9 @@ def _plan_board(url, company, rep, base=None):
             data = _page1(url, applied, company, rep)
             if data is None:
                 rep["failed"] = True
+                if rep.get("blocked"):
+                    logger.warning("workday plan: Cloudflare challenge for %r — planning stopped", company)
+                    break
                 logger.warning("workday plan: page 1 failed for %r applied=%s — slice skipped", company, applied)
                 continue
             total = data.get("total", 0) or 0
@@ -519,18 +531,18 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     stopped = bool(first) and take(first, final=(not offs) or len(first) < min(WORKDAY_PAGE_SIZE, leaf["K"]))
     try:
         for i, off in enumerate(offs):
-            if stopped:
+            if stopped or rep.get("blocked"):
                 break
             expect = min(WORKDAY_PAGE_SIZE, leaf["K"] - off)   # the last page is legitimately short
             data = _post(url, leaf["applied"], off, company, rep)
             jobs = list(data.get("jobPostings") or []) if data else []
             retried = False
             if not data and rep.get("challenge"):
-                # Cloudflare challenge: the same request can never pass, so no retry; keep what was fetched
-                rep["failed"] = True
-                logger.warning("workday fetch: Cloudflare challenge at offset=%d for %r applied=%s — partial result",
+                # Cloudflare challenge: the same request can never pass, so no retry and no further request
+                # for this scan (rep["blocked"]); keep what was fetched
+                logger.warning("workday fetch: Cloudflare challenge at offset=%d for %r applied=%s — scan stopped, partial result",
                                off, company, leaf["applied"])
-                continue
+                break
             if not data or len(jobs) < expect:
                 # retried here, before the gate sees the page: a short page must not look "all seen"
                 retried = True
@@ -577,7 +589,13 @@ def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
     merged, leaf_got = {}, []
     try:
         for leaf in leaves:
-            got = _fetch_leaf(url, leaf, company, rep, gate, norm)
+            if rep.get("blocked"):
+                # Cloudflare challenge: no more requests, but page 1 rows fetched while planning are kept
+                got = {}
+                for p in leaf["first"]:
+                    _merge_row(got, _job_key(p), p)
+            else:
+                got = _fetch_leaf(url, leaf, company, rep, gate, norm)
             for k, p in got.items():
                 _merge_row(merged, k, p)
             leaf_got.append((leaf["applied"], set(got)))
@@ -636,7 +654,7 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
         # same rule as _recover: rows an early-exited leaf skipped on purpose are credited only while unseen
         return size - len(have) - max(0, skipped - (len(have) - have0))
 
-    while gap() > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and spent < allowance:
+    while not rep.get("blocked") and gap() > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and spent < allowance:
         words = collections.Counter()
         for k in have:
             title = (merged[k].get("title") or "").lower()

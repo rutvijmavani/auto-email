@@ -193,6 +193,10 @@ def get_recent_crawls(n=CRAWLS_TO_USE):
 # ATHENA QUERY
 # ─────────────────────────────────────────
 
+# Bump whenever MAIN_QUERY changes: it is part of the cached CSV name, so rows produced by an older
+# query are never reused as the current result (q2 = Workday bare hosts added).
+ATHENA_QUERY_REV = "q2"
+
 MAIN_QUERY = """
 SELECT
     url,
@@ -1050,6 +1054,7 @@ def main():
     for crawl_id in unscanned:
         csv_path = (f"data/athena_"
                     f"{crawl_id}_"
+                    f"{ATHENA_QUERY_REV}_"
                     f"{datetime.now().strftime('%Y-%m-%d')}"
                     f".csv")
 

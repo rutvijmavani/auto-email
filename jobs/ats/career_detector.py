@@ -294,16 +294,16 @@ def _extract_workday(text):
             continue   # keep scanning: a later link may name the real site
         slug = json.dumps({"slug": m.group(1), "wd": m.group(2) or "", "path": path})
         return {"platform": "workday", "slug": slug}
-    if root_only:
-        slug = json.dumps({"slug": root_only[0], "wd": root_only[1], "path": "careers"})
-        return {"platform": "workday", "slug": slug}
-    # alternate myworkdaysite.com domain
+    # alternate myworkdaysite.com domain: names its site, so it beats a root-only myworkdayjobs match
     m = re.search(
         r'(wd\d+)\.myworkdaysite\.com/recruiting/([a-z0-9-]+)/([a-zA-Z0-9_%-]*)',
         text, re.IGNORECASE,
     )
     if m:
         slug = json.dumps({"slug": m.group(2), "wd": m.group(1), "path": m.group(3)})
+        return {"platform": "workday", "slug": slug}
+    if root_only:
+        slug = json.dumps({"slug": root_only[0], "wd": root_only[1], "path": "careers"})
         return {"platform": "workday", "slug": slug}
     return None
 

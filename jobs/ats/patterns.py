@@ -120,6 +120,13 @@ def _make_patterns():
             "path": path or "careers",
         })
 
+    def _workday_root_only(m):
+        """True when the match names no career site (bare host or locale-only path)."""
+        parts = [p for p in (m.group(3) or "").split("/") if p]
+        return not any(not _LOCALE_PATTERN.match(p) for p in parts)
+
+    _workday_slug.root_only = _workday_root_only
+
     patterns.append((
         re.compile(
             # (?<![a-z0-9.-]) keeps "a.b.myworkdayjobs.com" from reading "b" as a bare tenant.
@@ -526,18 +533,24 @@ def match_ats_pattern(url):
     # Decode Google redirect URLs
     url = _decode_google_redirect(url)
 
+    root_only = None   # a workday match that names no career site: kept while an explicit site is looked for
     for pattern, platform, extractor in ATS_URL_PATTERNS:
         # Every match is tried: an earlier one may be rejected (e.g. jobs.myworkdayjobs.com)
         # while a later one in the same text is a real tenant.
         for m in pattern.finditer(url):
             try:
                 slug = extractor(m)
+                bare = bool(slug) and getattr(extractor, "root_only", lambda _m: False)(m)
             except Exception:
+                continue
+            if slug and bare:
+                if root_only is None:
+                    root_only = {"platform": platform, "slug": slug}
                 continue
             if slug:
                 return {"platform": platform, "slug": slug}
 
-    return None
+    return root_only
 
 
 def validate_slug_for_company(slug, company):
