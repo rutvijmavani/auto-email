@@ -234,6 +234,8 @@ def fetch_jobs(slug_info, company, stop_check=None):
         stop = STOP_ALL_PAGES
     split = bool(nodes)   # a board no facet could split is reported by its root total
     notes = ["split by facet"] if split else []
+    if rep.get("capped_slices"):
+        notes.append(f"{len(rep['capped_slices'])} slices over the cap with no usable facet")
     if rep.get("partial"):
         notes.append("nodes still short: " + "; ".join(f"{n} of {k}" for _a, k, n in rep["partial"]))
     if rep.get("leaf_mismatch"):
@@ -458,7 +460,8 @@ def _plan_board(url, company, rep, base=None):
     nodes are the capped queries that were split (applied, K, facet, depth, sum, used) for the recovery steps.
 
     rep gets "reported" (page-1 total of the root query), "expected" (the board size, only when split),
-    "capped" (a slice that no facet can split), "failed" (a node's page 1 failed), "over_budget".
+    "capped" (the root itself is capped and no facet can split it), "capped_slices" (a child slice like
+    that: _recover decides whether it leaves a gap), "failed" (a node's page 1 failed), "over_budget".
     `base` = filters applied to the whole board (the Accenture US filter).
     """
     base = dict(base or {})
@@ -512,7 +515,11 @@ def _plan_board(url, company, rep, base=None):
             if best is None:
                 keep = min(WORKDAY_RESULT_CAP, total)
                 leaves.append(_make_leaf(rep, applied, keep, first))
-                rep["capped"] = True
+                if depth:
+                    # its parent node covers it: _recover sets "capped" if the node stays short
+                    rep.setdefault("capped_slices", []).append((applied, size))
+                else:
+                    rep["capped"] = True   # nothing above the root can check coverage
                 (logger.info if depth else logger.warning)(
                     "workday plan: %r slice %s has %d jobs and no usable facet — first %d only",
                     company, applied, size, keep)
@@ -563,13 +570,14 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
 
     offs = leaf["offs"]
     first = leaf["first"]
-    short = 0   # rows missing from pages that stayed short: a real gap, not rows the gate skipped on purpose
+    asked = 0   # offsets of `offs` already requested
     # a cached page 1 shorter than it should be is not shown to the gate
     stopped = bool(first) and take(first, final=(not offs) or _distinct(first) < min(WORKDAY_PAGE_SIZE, leaf["K"]))
     try:
         for i, off in enumerate(offs):
             if stopped or rep.get("blocked"):
                 break
+            asked = i + 1
             expect = min(WORKDAY_PAGE_SIZE, leaf["K"] - off)   # the last page is legitimately short
             final = i == len(offs) - 1
             data = _post(url, leaf["applied"], off, company, rep)
@@ -601,7 +609,6 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                     logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
                                    off, company, leaf["applied"])
                     continue
-            short += max(0, expect - _distinct(jobs))
             # a page that needed a retry (two responses merged) or is still short keeps its rows but is not gated
             if take(jobs, final or _distinct(jobs) < expect or retried):
                 stopped = True
@@ -610,8 +617,10 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         e.got = got          # rows already fetched survive the hard stop
         raise
     if stopped:
-        # only the pages never requested count as skipped on purpose; a short page earlier in the leaf stays a gap
-        rep.setdefault("early_leaves", []).append((leaf["applied"], leaf["K"] - short, len(got)))
+        # only the pages never requested count as skipped on purpose; rows lost on a requested page
+        # (short, or repeating an earlier one) stay a gap
+        unrequested = sum(min(WORKDAY_PAGE_SIZE, leaf["K"] - o) for o in offs[asked:])
+        rep.setdefault("early_leaves", []).append((leaf["applied"], len(got) + unrequested, len(got)))
     if not stopped and len(got) != leaf["K"]:
         rep.setdefault("leaf_mismatch", []).append((leaf["applied"], leaf["K"], len(got)))
     return got
@@ -1001,7 +1010,9 @@ def _job_req_id(job, external_path, job_url):
     (location), Intel ("Spotlight Job") or Wisconsin (no id bullet), where many jobs then share one id.
     The id is the text after the last "_" of the last externalPath segment. Use the bullet equal to it, or
     to it minus a trailing "-<digits>" (Intel JR0289044-1 -> JR0289044); else the token itself (Wisconsin).
-    Without a usable path token: bulletFields[0], else a regex on the job URL (legacy behaviour).
+    Without a usable path token: bulletFields[0] if it is shaped like an id (no spaces, has a digit);
+    else the URL's own posting id (a numeric last segment or "_R-..."), so legacy ".../1" and ".../2"
+    sharing a text bullet stay apart; else bulletFields[0] (shared landing URL).
     """
     bullets = [b for b in (job.get("bulletFields") or []) if isinstance(b, str)]
     segment = (external_path or "").rstrip("/").rsplit("/", 1)[-1]
@@ -1013,10 +1024,17 @@ def _job_req_id(job, external_path, job_url):
             if cand in bullets:
                 return cand
         return token
-    if bullets and bullets[0]:
-        return bullets[0]
+    first = bullets[0] if bullets else ""
+    if re.fullmatch(r"\S*\d\S*", first):
+        return first
+    try:
+        last = urlparse(job_url).path.rstrip("/").rsplit("/", 1)[-1]
+    except ValueError:   # malformed URL: no posting id to read from its path
+        last = ""
+    if last.isdigit():
+        return last
     m = re.search(r"_((?:JR|R)-?\d+(?:-\d+)?)", job_url)
-    return m.group(1) if m else ""
+    return m.group(1) if m else first
 
 
 def _normalize(job, company, domain, path, slug_info=None):

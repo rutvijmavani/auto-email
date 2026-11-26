@@ -544,10 +544,16 @@ def match_ats_pattern(url, own_url=False):
 
     own_url=True: `url` is one pasted link, not free text. Only a match that begins in its own
     scheme/host counts, so a link inside its path or query cannot decide the platform. User
-    information ("user@") is dropped first: it is not the host.
+    information ("user@") is dropped first: it is not the host. A "/url?q=" redirect is followed
+    only from a Google origin; a pasted one from any other origin matches nothing.
     """
     if not url:
         return None
+
+    if own_url:
+        redirect = _redirect_parts(url)
+        if redirect and not _is_google_origin(redirect[0]):
+            return None
 
     # Decode Google redirect URLs
     url = _decode_google_redirect(url)
@@ -723,23 +729,42 @@ def validate_company_match(response_text, expected_company):
     return False
 
 
+_GOOGLE_HOST = re.compile(r'(?:www\.)?google\.(?:com?\.[a-z]{2}|com|[a-z]{2})\.?', re.IGNORECASE)
+
+
+def _redirect_parts(url):
+    """(parsed URL, "q" value) when `url` has the "/url?q=" redirect shape, else None."""
+    from urllib.parse import urlparse, parse_qs
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # Scraped HTML can contain "http://[..." — urlparse rejects the bracketed
+        # netlocs; treat as "not a redirect" and let the ATS regexes decide.
+        return None
+    if parsed.path != "/url":
+        return None
+    q = parse_qs(parsed.query).get("q")
+    return (parsed, q[0]) if q else None
+
+
+def _is_google_origin(parsed):
+    """A Google host, or a relative link (as scraped from a Google results page)."""
+    if not parsed.scheme and not parsed.netloc:
+        return True
+    return parsed.scheme in ("", "http", "https") and bool(_GOOGLE_HOST.fullmatch(parsed.hostname or ""))
+
+
 def _decode_google_redirect(url):
     """
     Handle Google redirect URLs:
     /url?q=https://boards.greenhouse.io/stripe/jobs&sa=...
     → https://boards.greenhouse.io/stripe/jobs
+    A redirect shape on any other host is returned unchanged.
     """
     if not url:
         return url
-    from urllib.parse import urlparse, parse_qs, unquote
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        # Scraped HTML can contain "http://[..." — urlparse rejects the bracketed
-        # netlocs; treat as "not a Google redirect" and let the ATS regexes decide.
-        return url
-    if parsed.path == "/url":
-        qs = parse_qs(parsed.query)
-        if "q" in qs:
-            return unquote(qs["q"][0])
+    from urllib.parse import unquote
+    redirect = _redirect_parts(url)
+    if redirect and _is_google_origin(redirect[0]):
+        return unquote(redirect[1])
     return url

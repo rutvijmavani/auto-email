@@ -13,6 +13,9 @@ ARCHIVE_FIELDS = [
     "crawl_source", "last_seen_crawl", "source",
     "first_seen", "archived_at",
 ]
+# SET clause that keeps the newer crawl (takes the incoming id twice). Names in the sliding
+# window are CC-MAIN-YYYY-WW, so text order is age order.
+_KEEP_NEWEST_CRAWL = "last_seen_crawl = MAX(COALESCE(last_seen_crawl, ?), ?)"
 
 
 # ─────────────────────────────────────────
@@ -187,8 +190,8 @@ def upsert_company(platform, slug, company_name=None,
             params.append(job_count)
 
         if crawl_source is not None:
-            updates.append("last_seen_crawl = ?")
-            params.append(crawl_source)
+            updates.append(_KEEP_NEWEST_CRAWL)
+            params.extend([crawl_source, crawl_source])
 
         # Persist source so detection/backfill rows are never
         # accidentally downgraded to 'crawl' by subsequent updates
@@ -227,7 +230,7 @@ def bulk_insert_slugs(platform, slugs, crawl_source):
     """
     Bulk insert slugs from Athena results.
     INSERT OR IGNORE — never overwrites existing data.
-    Updates last_seen_crawl for existing rows.
+    Moves last_seen_crawl of existing rows forward only: crawls may be scanned in any order.
 
     Returns count of newly inserted rows.
     """
@@ -250,11 +253,11 @@ def bulk_insert_slugs(platform, slugs, crawl_source):
                 added += 1
             else:
                 # Update last_seen_crawl for existing rows
-                conn.execute("""
+                conn.execute(f"""
                     UPDATE ats_companies
-                    SET last_seen_crawl = ?
+                    SET {_KEEP_NEWEST_CRAWL}
                     WHERE platform = ? AND slug = ?
-                """, (crawl_source, platform, str(slug)))
+                """, (crawl_source, crawl_source, platform, str(slug)))
 
         conn.commit()
         return added

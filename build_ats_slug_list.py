@@ -196,8 +196,7 @@ def get_recent_crawls(n=CRAWLS_TO_USE):
 # Bump whenever MAIN_QUERY changes: it is part of the cached CSV name, so rows produced by an older
 # query are never reused as the current result (q2 = Workday bare hosts added).
 # Forward-only: it does not reopen crawls already in scanned_crawls, so a changed query first runs on
-# the next new crawl. To rescan by hand, delete only the NEWEST crawl's scanned_crawls row: rescanning
-# older ones would move last_seen_crawl back (bulk_insert_slugs overwrites it, newest is done first).
+# the next new crawl. To rescan by hand, delete the wanted crawls' scanned_crawls rows.
 ATHENA_QUERY_REV = "q2"
 
 MAIN_QUERY = """
