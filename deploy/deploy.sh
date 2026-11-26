@@ -171,14 +171,16 @@ else
     # setup_cron.sh does not reach them on its own (the VM ran a stale run_monthly.sh for a week).
     # Persisted in a flag file so a failed regeneration (or an aborted deploy) is retried by the next deploy,
     # even when that one pulls nothing; cleared only after setup_cron.sh succeeds.
-    # Checked BEFORE the pull: a deploy interrupted after the pull would leave nothing to detect next time.
-    if ! git diff --quiet HEAD "origin/${_BRANCH}" -- setup_cron.sh; then
-        mkdir -p "$PROJECT_DIR/data" && touch "$_CRON_PENDING_FLAG"
-    fi
+    # Set BEFORE the pull and cleared only once the pulled commits are known to leave setup_cron.sh alone:
+    # the pull can bring commits pushed since the fetch above, and a deploy interrupted during or right
+    # after it would leave nothing to detect next time.
+    _cron_was_pending=false
+    if [[ -f "$_CRON_PENDING_FLAG" ]]; then _cron_was_pending=true; fi
+    mkdir -p "$PROJECT_DIR/data"
+    touch "$_CRON_PENDING_FLAG"
     git pull origin "${_BRANCH}"
-    # again after the pull: it can bring commits pushed since the fetch above
-    if ! git diff --quiet "$PREVIOUS_SHA" HEAD -- setup_cron.sh; then
-        mkdir -p "$PROJECT_DIR/data" && touch "$_CRON_PENDING_FLAG"
+    if ! $_cron_was_pending && git diff --quiet "$PREVIOUS_SHA" HEAD -- setup_cron.sh; then
+        rm -f "$_CRON_PENDING_FLAG"
     fi
     NEW_SHA=$(git rev-parse --short HEAD)
     echo "  Updated to : $NEW_SHA"

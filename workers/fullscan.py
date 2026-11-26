@@ -42,8 +42,9 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     title+location -> save_pending_detail.  adaptive_seen is deleted when the fullscan FINISHES.
 
     On completion: one RENAME promotes NEW over OLD (also after an incomplete fetch: a job
-                   missing from the bloom is just re-evaluated next scan).
-    On resume:     both keys are preserved; NEW bloom provides intra-scan dedup
+                   missing from the bloom is just re-evaluated next scan).  Not for an
+                   unusable ATS config (STOP_NO_CONFIG): both stay, no adaptive bootstrap.
+    On resume:    both keys are preserved; NEW bloom provides intra-scan dedup
                    so jobs queued before the pause are not re-queued.
 
 ─── Order for a new company ──────────────────────────────────────────────────
@@ -141,7 +142,7 @@ from workers.paginator import estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import detail_key_present, get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
-from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_REQUEST_FAILED, FetchReport, report_of
+from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REQUEST_FAILED, FetchReport, report_of
 from db.scan_health import SOURCE_FULLSCAN, annotate_latest, record_scan
 from workers.http_client import CeilingExceeded
 from jobs.job_filter import filter_jobs, filter_jobs_title_only, passes_listing_date
@@ -1134,6 +1135,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             # repeat page, shortfall) would loop forever, so it completes normally with its verdict recorded.
             # A failure that never clears gets the same treatment once the retry budget is spent.
             _partial_fetch = _partial_retry_allowed(r, company)
+        # Unusable slug / undiscoverable target: nothing was fetched, so this scan is no view of the board.
+        _no_config = _report.complete is False and _report.stop_reason == STOP_NO_CONFIG
         record_scan(
             company, platform, SOURCE_FULLSCAN, _report,
             raw_count=len(raw_jobs), valid_count=len(valid_jobs),
@@ -1332,14 +1335,22 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             # Scan completed — a later transient failure gets a fresh retry budget.
             _clear_partial_retries(r, company)
 
-            # Promote NEW bloom → OLD with one RENAME (the gate for the next fullscan and the
-            # adaptive stop test). Always, even after an incomplete fetch: a job missing from the
-            # bloom is simply re-evaluated next scan.
-            bloom.finalize()
-            # The fullscan has now seen everything adaptive handled meanwhile.
-            # (An ID adaptive adds after this scan's last read but before this delete is lost,
-            # so a rejected job may be queued once more: accepted.)
-            r.delete(adaptive_seen_key)
+            if _no_config:
+                # Not an empty board: the last completed baseline stays (old bloom and adaptive_seen),
+                # so a repaired slug does not re-evaluate everything already handled.
+                logger.warning(
+                    "fullscan [%s]: unusable ATS config (%s) — nothing fetched, bloom and adaptive_seen kept",
+                    company, _report.note,
+                )
+            else:
+                # Promote NEW bloom → OLD with one RENAME (the gate for the next fullscan and the
+                # adaptive stop test). Also after an incomplete fetch: a job missing from the
+                # bloom is simply re-evaluated next scan.
+                bloom.finalize()
+                # The fullscan has now seen everything adaptive handled meanwhile.
+                # (An ID adaptive adds after this scan's last read but before this delete is lost,
+                # so a rejected job may be queued once more: accepted.)
+                r.delete(adaptive_seen_key)
 
             # Reschedule using gap-detection algorithm (Phase 2 — thundering herd prevention).
             #
@@ -1407,7 +1418,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 # ── Bootstrap new companies into WARMING adaptive cycle ───────
                 # Only after successful DB write — adaptive polling must start
                 # from a persisted baseline, not an in-memory-only scan result.
-                if is_first_fullscan:
+                if is_first_fullscan and not _no_config:
                     try:
                         _bootstrap_warming_adaptive(company, r)
                     except Exception as bw_exc:
@@ -1431,7 +1442,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
 
                 # Daily digest: this scan saw the whole board, so its counts are
                 # the company's "jobs fetched / matched" (see workers/digest_counts).
-                record_fullscan_counts(r, company, len(valid_jobs), len(title_matched))
+                if not _no_config:
+                    record_fullscan_counts(r, company, len(valid_jobs), len(title_matched))
 
                 # Sync prospective_companies.last_checked_at and
                 # consecutive_empty_days so the monitor table reflects actual
@@ -1439,6 +1451,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 # "Empty" means the ATS returned no jobs at all (valid_jobs), never
                 # "no job matched our title filter": a big board with no matching
                 # titles is healthy and must not drift toward ATS re-detection.
+                # An unusable config counts as empty on purpose (as in jobs/job_monitor.py):
+                # re-detection is what repairs it.
                 try:
                     from db.job_monitor import update_company_check
                     update_company_check(company, found_jobs=(len(valid_jobs) > 0))

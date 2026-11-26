@@ -49,6 +49,12 @@ class EarlyExitGate:
         """A new gate with the same seen-check and thresholds and a zeroed counter."""
         return EarlyExitGate(self._is_seen, self.confirm_pages, self._id_key)
 
+    def reset_if_unseen(self, page_jobs) -> None:
+        """For a page the feeder cannot show in full: an unseen job on it resets the streak; it never adds to it."""
+        ids = [j.get(self._id_key) for j in (page_jobs or []) if j.get(self._id_key)]
+        if not all(self._is_seen(i) for i in ids):
+            self.streak = 0
+
     def __call__(self, page_jobs) -> bool:
         """Judge one page. True = stop paging now."""
         ids = [j.get(self._id_key) for j in (page_jobs or []) if j.get(self._id_key)]

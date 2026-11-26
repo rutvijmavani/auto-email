@@ -273,6 +273,7 @@ def _extract_api_paths(bundle_text):
 # Each takes raw text, returns {"platform": ..., "slug": ...} or None
 # ─────────────────────────────────────────────────────────────────────────────
 
+from jobs.ats.patterns import URL_SEGMENT_END as _URL_SEGMENT_END
 from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
 
 
@@ -299,7 +300,7 @@ def _extract_workday(text):
     for m in re.finditer(
         # the locale may sit before /recruiting/ or after the tenant
         r'(wd\d+)\.myworkdaysite\.com/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)'
-        r'(?![a-z0-9_%-])(?!\.[a-z0-9])'   # the whole tenant segment; the URL may end right after it
+        + _URL_SEGMENT_END +   # the whole tenant segment; the URL may end right after it
         r'(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*))?',
         text, re.IGNORECASE,
     ):

@@ -360,9 +360,10 @@ def _charge_retry(rep):
     return True
 
 
-def _post(url, applied, offset, company, rep, text=None):
+def _post(url, applied, offset, company, rep, text=None, before_retry=None):
     """One list request; it and each of its retries count against the budget. Raises _OverBudget when
-    nothing is left for it; returns the JSON or None. After a Cloudflare challenge nothing more is sent (None)."""
+    nothing is left for it; returns the JSON or None. After a Cloudflare challenge nothing more is sent (None).
+    `before_retry` replaces the default retry check; it must charge the budget itself (_charge_retry)."""
     if rep.get("blocked"):
         return None
     if rep.get("logical", 0) >= rep.get("budget", 0.0):
@@ -376,7 +377,7 @@ def _post(url, applied, offset, company, rep, text=None):
     if text:
         body["searchText"] = text
     data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday",
-                           before_retry=lambda: _charge_retry(rep))
+                           before_retry=before_retry or (lambda: _charge_retry(rep)))
     rep["challenge"] = (not data) and last_post_was_challenge()   # a Cloudflare challenge is not retried
     if rep["challenge"]:
         # the whole scan stops: no more pages, sibling leaves or recovery
@@ -544,11 +545,16 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     def take(jobs, final):
         for p in jobs:
             _merge_row(got, _job_key(p), p)
-        if leaf_gate is None or norm is None or final:
+        if leaf_gate is None or norm is None:
             return False
         seen = [j for j in map(norm, jobs) if j]
-        # a page with dropped (titleless) rows was not fully shown to the gate, so it is not judged
-        if len(seen) == len(jobs) and leaf_gate(seen):
+        if final or len(seen) != len(jobs):
+            # not a page the gate may stop on (last, short, retried or with titleless rows),
+            # but an unseen job on it still breaks the streak
+            if hasattr(leaf_gate, "reset_if_unseen"):
+                leaf_gate.reset_if_unseen(seen)
+            return False
+        if leaf_gate(seen):
             rep["early"] = True
             return True
         return False
@@ -618,25 +624,30 @@ def _merge_row(merged, k, p):
 def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
     """Fetch the leaves one after another. Returns (merged {job_key: posting}, [(applied, {keys})])."""
     merged, leaf_got = {}, []
+
+    def keep(leaf, got):
+        for k, p in got.items():
+            _merge_row(merged, k, p)
+        leaf_got.append((leaf["applied"], set(got)))
+
+    def planned(leaf):
+        """The page 1 rows fetched while planning: kept, without a request, when no more can be sent."""
+        got = {}
+        for p in leaf["first"]:
+            _merge_row(got, _job_key(p), p)
+        return got
+
+    done = 0
     try:
         for leaf in leaves:
-            if rep.get("blocked"):
-                # Cloudflare challenge: no more requests, but page 1 rows fetched while planning are kept
-                got = {}
-                for p in leaf["first"]:
-                    _merge_row(got, _job_key(p), p)
-            else:
-                got = _fetch_leaf(url, leaf, company, rep, gate, norm)
-            for k, p in got.items():
-                _merge_row(merged, k, p)
-            leaf_got.append((leaf["applied"], set(got)))
+            # after a Cloudflare challenge no more requests are sent
+            keep(leaf, planned(leaf) if rep.get("blocked") else _fetch_leaf(url, leaf, company, rep, gate, norm))
+            done += 1
     except _OverBudget as e:
         rep["failed"] = True
-        partial = getattr(e, "got", None) or {}
-        for k, p in partial.items():
-            _merge_row(merged, k, p)
-        if partial:
-            leaf_got.append((leaf["applied"], set(partial)))
+        keep(leaves[done], getattr(e, "got", None) or {})
+        for leaf in leaves[done + 1:]:
+            keep(leaf, planned(leaf))
         logger.warning("workday fetch: request budget used up (%s) — partial result", e)
     return merged, leaf_got
 
@@ -688,6 +699,14 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
         found = len(have) + pending
         return size - found - max(0, skipped - (found - have0))
 
+    def retry():
+        """One retry of a search request, only while the node's allowance and the scan budget both cover it."""
+        nonlocal spent
+        if allowance - spent < 1 or not _charge_retry(rep):
+            return False
+        spent += 1
+        return True
+
     while not rep.get("blocked") and gap() > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and allowance - spent >= 1:
         words = collections.Counter()
         for k in have:
@@ -709,10 +728,8 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
                 for o in range(off, end, WORKDAY_PAGE_SIZE):
                     if allowance - spent < 1:   # retries used up what was left of the chunk
                         break
-                    before = rep.get("logical", 0)
-                    data = _post(url, applied, o, company, rep, text=term)
-                    # only requests actually sent, retries included: a chunk can end early
-                    spent += max(1, rep.get("logical", 0) - before)
+                    spent += 1   # only requests actually sent are charged (retry() adds its own)
+                    data = _post(url, applied, o, company, rep, text=term, before_retry=retry)
                     jobs = (data or {}).get("jobPostings") or []
                     if not jobs:
                         ended = True
@@ -726,6 +743,8 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
                         elif k not in have and k not in new:
                             new[k] = p
                             fresh += 1
+                    if gap(len(new)) <= tol:
+                        break
                 off = end
                 if rows == 0 or fresh / rows < WORKDAY_SEARCH_MIN_NEW:
                     break
