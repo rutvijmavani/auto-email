@@ -298,11 +298,12 @@ def _extract_workday(text):
     alt_root_only = None   # alternate-domain match that names no site: used if no later one names it
     for m in re.finditer(
         # the locale may sit before /recruiting/ or after the tenant
-        r'(wd\d+)\.myworkdaysite\.com/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)/'
-        r'(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*)',
+        r'(wd\d+)\.myworkdaysite\.com/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)'
+        r'(?![a-z0-9_%-])(?!\.[a-z0-9])'   # the whole tenant segment; the URL may end right after it
+        r'(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*))?',
         text, re.IGNORECASE,
     ):
-        path = m.group(3)
+        path = m.group(3) or ""
         if re.fullmatch(r'[a-z]{2}[-_][A-Z]{2}', path):
             path = ""   # locale-only URL: the locale is not the site
         info = {"slug": m.group(2), "wd": m.group(1), "path": path or "careers", "site": "myworkdaysite"}

@@ -95,7 +95,7 @@ def match_job_url(job_url: str) -> "tuple[dict | None, str | None]":
         if not host.endswith((".myworkdayjobs.com", ".myworkdaysite.com")):
             hit = None
         else:
-            hit = match_ats_pattern(f"{parsed.scheme}://{host}{parsed.path}")
+            hit = match_ats_pattern(f"{parsed.scheme}://{host}{parsed.path}", own_url=True)
             if hit and hit["platform"] == "workday":
                 # the tenant must come from the host itself, never from a tenant-like string in the path
                 # (myworkdayjobs: first host label = tenant; myworkdaysite: first host label = wd)

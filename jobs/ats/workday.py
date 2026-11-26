@@ -296,7 +296,8 @@ def _board_is_capped(url, applied, first_jobs, rep, company):
     body = {"limit": WORKDAY_PAGE_SIZE, "offset": WORKDAY_RESULT_CAP}
     if applied:
         body["appliedFacets"] = applied
-    data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday")
+    data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday",
+                           before_retry=None if rep is None else lambda: _charge_retry(rep))
     if rep is not None:
         rep["pages"] += 1
     if not data:
@@ -350,9 +351,18 @@ def _budget_add(rep, cost):
     rep["budget"] = rep.get("budget", 0.0) + cost * (1 + WORKDAY_BUDGET_SLACK) + WORKDAY_BUDGET_PAD
 
 
+def _charge_retry(rep):
+    """Charge one retry inside fetch_json_post against the budget; False (no retry) once it is used up."""
+    if rep.get("logical", 0) >= rep.get("budget", 0.0):
+        logger.warning("workday fetch: request budget used up (%d requests) — retry skipped", rep.get("logical", 0))
+        return False
+    rep["logical"] = rep.get("logical", 0) + 1
+    return True
+
+
 def _post(url, applied, offset, company, rep, text=None):
-    """One list request, counted against the budget. Raises _OverBudget past it; returns the JSON or None.
-    After a Cloudflare challenge nothing more is sent (None)."""
+    """One list request; it and each of its retries count against the budget. Raises _OverBudget when
+    nothing is left for it; returns the JSON or None. After a Cloudflare challenge nothing more is sent (None)."""
     if rep.get("blocked"):
         return None
     if rep.get("logical", 0) >= rep.get("budget", 0.0):
@@ -365,7 +375,8 @@ def _post(url, applied, offset, company, rep, text=None):
         body["appliedFacets"] = applied
     if text:
         body["searchText"] = text
-    data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday")
+    data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday",
+                           before_retry=lambda: _charge_retry(rep))
     rep["challenge"] = (not data) and last_post_was_challenge()   # a Cloudflare challenge is not retried
     if rep["challenge"]:
         # the whole scan stops: no more pages, sibling leaves or recovery
@@ -533,8 +544,11 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     def take(jobs, final):
         for p in jobs:
             _merge_row(got, _job_key(p), p)
-        if leaf_gate is not None and norm is not None and not final \
-                and leaf_gate([j for j in map(norm, jobs) if j]):
+        if leaf_gate is None or norm is None or final:
+            return False
+        seen = [j for j in map(norm, jobs) if j]
+        # a page with dropped (titleless) rows was not fully shown to the gate, so it is not judged
+        if len(seen) == len(jobs) and leaf_gate(seen):
             rep["early"] = True
             return True
         return False
@@ -669,9 +683,10 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
     spent = 0
     have0 = len(have)
 
-    def gap():
+    def gap(pending=0):
         # same rule as _recover: rows an early-exited leaf skipped on purpose are credited only while unseen
-        return size - len(have) - max(0, skipped - (len(have) - have0))
+        found = len(have) + pending
+        return size - found - max(0, skipped - (found - have0))
 
     while not rep.get("blocked") and gap() > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and allowance - spent >= 1:
         words = collections.Counter()
@@ -685,35 +700,41 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
         term = words.most_common(1)[0][0]
         tried.add(term)
         new, off, ended = {}, 0, False
-        while off < WORKDAY_RESULT_CAP and not ended and allowance - spent >= 1:
-            chunk = min(WORKDAY_SEARCH_CHUNK_PAGES, int(allowance - spent))   # never past the allowance
-            _budget_add(rep, chunk)
-            rows = fresh = 0
-            end = min(off + chunk * WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP)
-            for o in range(off, end, WORKDAY_PAGE_SIZE):
-                data = _post(url, applied, o, company, rep, text=term)
-                spent += 1   # only requests actually sent: a chunk can end early
-                jobs = (data or {}).get("jobPostings") or []
-                if not jobs:
-                    ended = True
+        try:
+            while off < WORKDAY_RESULT_CAP and not ended and allowance - spent >= 1 and gap(len(new)) > tol:
+                chunk = min(WORKDAY_SEARCH_CHUNK_PAGES, int(allowance - spent))   # never past the allowance
+                _budget_add(rep, chunk)
+                rows = fresh = 0
+                end = min(off + chunk * WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP)
+                for o in range(off, end, WORKDAY_PAGE_SIZE):
+                    if allowance - spent < 1:   # retries used up what was left of the chunk
+                        break
+                    before = rep.get("logical", 0)
+                    data = _post(url, applied, o, company, rep, text=term)
+                    # only requests actually sent, retries included: a chunk can end early
+                    spent += max(1, rep.get("logical", 0) - before)
+                    jobs = (data or {}).get("jobPostings") or []
+                    if not jobs:
+                        ended = True
+                        break
+                    for p in jobs:
+                        rows += 1
+                        k = _job_key(p)
+                        if not p.get("title"):
+                            if k not in merged:
+                                merged[k] = p   # kept so a later titled copy can replace it; closes no gap
+                        elif k not in have and k not in new:
+                            new[k] = p
+                            fresh += 1
+                off = end
+                if rows == 0 or fresh / rows < WORKDAY_SEARCH_MIN_NEW:
                     break
-                for p in jobs:
-                    rows += 1
-                    k = _job_key(p)
-                    if not p.get("title"):
-                        if k not in merged:
-                            merged[k] = p   # kept so a later titled copy can replace it; closes no gap
-                    elif k not in have and k not in new:
-                        new[k] = p
-                        fresh += 1
-            off = end
-            if rows == 0 or fresh / rows < WORKDAY_SEARCH_MIN_NEW:
-                break
-        have |= set(new)
-        for k, p in new.items():
-            _merge_row(merged, k, p)
-        if new:
-            leaf_got.append((dict(applied), set(new)))
+        finally:   # rows already found survive a budget stop
+            have |= set(new)
+            for k, p in new.items():
+                _merge_row(merged, k, p)
+            if new:
+                leaf_got.append((dict(applied), set(new)))
         idle = 0 if new else idle + 1
         logger.info("workday search: %r term=%r new=%d unique_now=%d gap=%d applied=%s",
                     company, term, len(new), len(have), size - len(have), applied)
@@ -742,7 +763,12 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
             if size <= WORKDAY_WINDOW_MAX * WORKDAY_RESULT_CAP:
                 page1 = (rep.get("node_page1") or {}).get(json.dumps(applied, sort_keys=True)) or {}
                 window = _make_leaf(rep, dict(applied), min(size, WORKDAY_RESULT_CAP), page1.get("jobPostings"))
-                got = _fetch_leaf(url, window, company, rep)   # never gated
+                try:
+                    got = _fetch_leaf(url, window, company, rep)   # never gated
+                except _OverBudget as e:
+                    for k, p in (getattr(e, "got", None) or {}).items():
+                        _merge_row(merged, k, p)   # rows fetched before the budget stop are kept
+                    raise
                 for k, p in got.items():
                     _merge_row(merged, k, p)
                 leaf_got.append((dict(applied), set(got)))

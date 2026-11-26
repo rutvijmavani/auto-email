@@ -145,12 +145,14 @@ def fetch_json(url, params=None, retries=2,
 
 
 def fetch_json_post(url, body=None, retries=2,
-                    platform=None, track=True, headers=None):
+                    platform=None, track=True, headers=None, before_retry=None):
     """
     POST JSON to URL and return parsed response.
     Used by Workday — requires POST with JSON body, not GET.
     Optional headers param allows callers to override default headers
     (e.g. Workday requires full browser headers for pagination to work).
+    before_retry: called once before each retry (not the first attempt); a false
+    result gives up at once (no wait) and returns None — for a caller's request budget.
     """
     default_headers = {
         "User-Agent":   "Mozilla/5.0",
@@ -158,6 +160,9 @@ def fetch_json_post(url, body=None, retries=2,
     }
     request_headers = headers if headers is not None else default_headers
     _post_state.challenge = False
+
+    def may_retry():
+        return attempt < retries and (before_retry is None or bool(before_retry()))
 
     for attempt in range(retries + 1):
         start_ms    = int(time.time() * 1000)
@@ -194,11 +199,12 @@ def fetch_json_post(url, body=None, retries=2,
                 # Same single-record rule as fetch_json; Workday (the main
                 # caller) previously recorded no backoff and never ran the
                 # rate-limit alert check.
-                backoff_s = 60 if attempt < retries else 0
+                retry = may_retry()
+                backoff_s = 60 if retry else 0
                 if platform and track:
                     _record(platform, 429, elapsed_ms, backoff_s=backoff_s)
                     _check_rate_limit_alert(platform)
-                if attempt < retries:
+                if retry:
                     # FJP: POST failures were silent; mirror fetch_json.
                     logger.warning(
                         "Rate limited on %s (POST) — waiting %ds",
@@ -216,7 +222,7 @@ def fetch_json_post(url, body=None, retries=2,
             if 500 <= status_code < 600:
                 # Transient server error — retry with backoff
                 backoff_s = 2 ** attempt
-                if attempt < retries:
+                if may_retry():
                     time.sleep(backoff_s)
                     continue
                 logger.debug("fetch_json_post: HTTP %d on %s, retries exhausted", status_code, url)
@@ -233,7 +239,7 @@ def fetch_json_post(url, body=None, retries=2,
             if platform and track:
                 _record(platform, 0, int(time.time() * 1000) - start_ms,
                         error_type="requests_timeout")
-            if attempt < retries:
+            if may_retry():
                 time.sleep(2 ** attempt)
                 continue
             logger.debug("fetch_json_post: timeout on %s, retries exhausted", url)
@@ -242,7 +248,7 @@ def fetch_json_post(url, body=None, retries=2,
             if platform and track:
                 _record(platform, 0, int(time.time() * 1000) - start_ms,
                         error_type="requests_conn_err")
-            if attempt < retries:
+            if may_retry():
                 # Same transient-failure handling as the Timeout branch (and fetch_json).
                 time.sleep(2 ** attempt)
                 continue

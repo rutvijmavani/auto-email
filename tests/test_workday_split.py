@@ -18,7 +18,7 @@ class Board:
         self.jobs, self.cap, self.descriptors = jobs, cap, descriptors or {}
         self.calls = []
 
-    def __call__(self, url, body=None, headers=None, platform=None):
+    def __call__(self, url, body=None, headers=None, platform=None, **kw):
         self.calls.append(body)
         applied = body.get("appliedFacets") or {}
         text = (body.get("searchText") or "").lower()

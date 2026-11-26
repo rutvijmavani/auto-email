@@ -145,7 +145,7 @@ def _make_patterns():
     def _workdaysite_slug(m):
         wd     = m.group(1).lower()
         tenant = m.group(2).lower()
-        parts  = [p for p in m.group(3).strip("/").split("/") if p]
+        parts  = [p for p in (m.group(3) or "").split("/") if p]
         path   = next(
             (p for p in parts if not _LOCALE_PATTERN2.match(p)),
             "careers"   # locale-only path: never use the locale as the site
@@ -159,7 +159,7 @@ def _make_patterns():
 
     def _workdaysite_root_only(m):
         """True when the match names no career site (nothing or only a locale after the tenant)."""
-        parts = [p for p in m.group(3).split("/") if p]
+        parts = [p for p in (m.group(3) or "").split("/") if p]
         return not any(not _LOCALE_PATTERN2.match(p) for p in parts)
 
     _workdaysite_slug.root_only = _workdaysite_root_only
@@ -168,7 +168,8 @@ def _make_patterns():
         re.compile(
             r"(wd\d+)\.myworkdaysite\.com/"
             r"(?:[a-z]{2}[-_][A-Z]{2}/)?"   # optional locale: en-US, fr-FR, pt_BR
-            r"recruiting/([a-z0-9-]+)/([^?&#\s\"'<>]*)",
+            r"recruiting/([a-z0-9-]+)(?![a-z0-9_%-])(?!\.[a-z0-9])"   # the whole tenant segment
+            r"(?:/([^?&#\s\"'<>]*))?",   # the site part is optional: the URL may end at the tenant
             re.IGNORECASE
         ),
         "workday",
@@ -535,7 +536,8 @@ def match_ats_pattern(url, own_url=False):
     Returns {platform, slug} or None.
 
     own_url=True: `url` is one pasted link, not free text. Only a match that begins in its own
-    scheme/host counts, so a link inside its path or query cannot decide the platform.
+    scheme/host counts, so a link inside its path or query cannot decide the platform. User
+    information ("user@") is dropped first: it is not the host.
     """
     if not url:
         return None
@@ -550,7 +552,12 @@ def match_ats_pattern(url, own_url=False):
             netloc = urlsplit(url).netloc
         except ValueError:
             return None
-        start_limit = url.find(netloc) + len(netloc)
+        at = url.find(netloc)
+        if at < 0:   # urlsplit removed characters (tab/newline) from the host: not a clean pasted URL
+            return None
+        host = netloc.rsplit("@", 1)[-1]
+        url = url[:at] + host + url[at + len(netloc):]
+        start_limit = at + len(host)
 
     root_only = None   # a workday match that names no career site: kept while an explicit site is looked for
     for pattern, platform, extractor in ATS_URL_PATTERNS:

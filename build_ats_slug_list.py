@@ -531,15 +531,16 @@ def extract_slug(row):
     if domain == "myworkdayjobs.com":
         # {tenant}.{wdN}.myworkdayjobs.com -> 4th=tenant, 3rd=wdN
         # {tenant}.myworkdayjobs.com (bare) -> 3rd=tenant, 4th empty, stored as wd ""
-        if re.match(r'^wd[0-9]+$', third, re.IGNORECASE):
-            tenant = fourth.lower()
-            wd     = third.lower()
-        elif not fourth.strip():
+        # the missing 4th label is checked first: wd42.myworkdayjobs.com is the bare host of tenant wd42
+        if not fourth.strip():
             from jobs.ats.patterns import WORKDAY_NON_TENANT
             if third.lower() in WORKDAY_NON_TENANT:
                 return None   # a vendor/system host, not a tenant
             tenant = third.lower()
             wd     = ""
+        elif re.match(r'^wd[0-9]+$', third, re.IGNORECASE):
+            tenant = fourth.lower()
+            wd     = third.lower()
         else:
             return None  # skip non-WD subdomains
         # Extract path — skip locale prefix (en-US, en-GB, fr-FR etc.)
