@@ -292,7 +292,8 @@ def _extract_workday(text):
     text = _ENCODED_SLASH.sub('/', text)   # an escaped path still names its career site
     root_only = None   # fallback: a match that names no career site (bare host or locale-only)
     for m in re.finditer(
-        r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?::\d+)?'
+        r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])'
+        r'(?:\.(?=[:/]))?(?::\d+)?'   # a host may be written with its terminal dot
         r'(?:/' + _WORKDAY_SITE_SEGMENTS + r')?',
         text, re.IGNORECASE,
     ):
@@ -313,7 +314,7 @@ def _extract_workday(text):
     for m in re.finditer(
         # the locale may sit before /recruiting/ or after the tenant
         # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
-        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com(?::\d+)?/(?:(?-i:' + _URL_LOCALE_SEGMENT + r')/)?'
+        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com\.?(?::\d+)?/(?:(?-i:' + _URL_LOCALE_SEGMENT + r')/)?'
         r'recruiting/([a-z0-9-]+)'
         + _URL_SEGMENT_END +   # the whole tenant segment; the URL may end right after it
         r'(?:/' + _WORKDAY_SITE_SEGMENTS + r')?',

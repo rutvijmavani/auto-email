@@ -213,7 +213,8 @@ def _make_patterns():
     patterns.append((
         re.compile(
             # (?<![a-z0-9.-]) keeps "a.b.myworkdayjobs.com" from reading "b" as a bare tenant.
-            r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?::\d+)?"
+            r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])"
+            r"(?:\.(?=[:/]))?(?::\d+)?"   # a host may be written with its terminal dot
             r"(?:/" + _WORKDAY_PATH + r")?",
             re.IGNORECASE
         ),
@@ -244,7 +245,7 @@ def _make_patterns():
     patterns.append((
         re.compile(
             # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
-            r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com(?::\d+)?/"
+            r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com\.?(?::\d+)?/"
             r"(?:" + URL_LOCALE_SEGMENT + r"/)?"   # optional locale: en-US, fr-FR, pt_BR
             r"recruiting/([a-z0-9-]+)" + URL_SEGMENT_END +   # the whole tenant segment
             r"(?:/" + _WORKDAY_PATH + r")?",   # the site part is optional: the URL may end at the tenant
@@ -376,12 +377,18 @@ def _make_patterns():
         lambda m: json.dumps({"base": f"https://{m.group(1)}.avature.net", "path": "careers"}),
     ))
 
+    def _on_hosts(extractor, *hosts):
+        """Mark a fixed-host pattern: a pasted link (own_url) must be on exactly one of `hosts`."""
+        extractor.hosts = hosts
+        return extractor
+
     # Avature custom domains
     for _domain, _path in [("jobs.ea.com", "en_US/careers")]:
         patterns.append((
             re.compile(re.escape(_domain), re.IGNORECASE),
             "avature",
-            lambda m, d=_domain, p=_path: json.dumps({"base": f"https://{d}", "path": p}),
+            _on_hosts(lambda m, d=_domain, p=_path: json.dumps({"base": f"https://{d}", "path": p}),
+                      _domain),
         ))
 
     # ── Phenom People (custom domains) ──────────────────────────────────────────
@@ -397,11 +404,11 @@ def _make_patterns():
             re.compile(re.escape(_phenom_domain), re.IGNORECASE),
             "phenom",
             # Use default args to capture loop variables
-            lambda m, d=_phenom_domain, p=_phenom_path: json.dumps({
+            _on_hosts(lambda m, d=_phenom_domain, p=_phenom_path: json.dumps({
                 "base":    f"https://{d}",
                 "path":    p,
                 "sitemap": f"{p}/sitemap.xml",
-            }),
+            }), _phenom_domain),
         ))
 
     # ── TalentBrew / Radancy ─────────────────────────────────────────────────────
@@ -415,10 +422,10 @@ def _make_patterns():
         patterns.append((
             re.compile(re.escape(_tb_domain), re.IGNORECASE),
             "talentbrew",
-            lambda m, d=_tb_domain, t=_tb_tenant: json.dumps({
+            _on_hosts(lambda m, d=_tb_domain, t=_tb_tenant: json.dumps({
                 "base":      f"https://{d}",
                 "tenant_id": t,
-            }),
+            }), _tb_domain),
         ))
 
     # ── Google Careers XML feed ──────────────────────────────────────────────────
@@ -426,7 +433,7 @@ def _make_patterns():
     patterns.append((
         re.compile(r"google\.com/about/careers/applications/jobs/feed\.xml", re.IGNORECASE),
         "google",
-        lambda m: "{}",
+        _on_hosts(lambda m: "{}", "google.com", "www.google.com"),
     ))
 
     # Taleo — {company}.taleo.net/careersection/...
@@ -450,7 +457,7 @@ def _make_patterns():
     patterns.append((
         re.compile(r"jobs\.apple\.com/", re.IGNORECASE),
         "apple",
-        lambda m: "{}",
+        _on_hosts(lambda m: "{}", "jobs.apple.com"),
     ))
 
     # Eightfold.ai — {slug}.eightfold.ai/careers
@@ -614,7 +621,8 @@ def match_ats_pattern(url, own_url=False):
     Returns {platform, slug} or None.
 
     own_url=True: `url` is one pasted link, not free text. Only a match that begins in its own
-    scheme/host counts, so a link inside its path or query cannot decide the platform. User
+    scheme/host counts, so a link inside its path or query cannot decide the platform. A pattern
+    for fixed hosts (jobs.ea.com, ...) also needs the link's hostname to equal one of them. User
     information ("user@") is dropped first: it is not the host. A "/url?q=" redirect is followed
     only from a Google origin; a pasted one from any other origin matches nothing. A sitemap is
     recognised from the link's own path, and keeps its query.
@@ -634,7 +642,9 @@ def match_ats_pattern(url, own_url=False):
     if own_url:
         from urllib.parse import urlsplit
         try:
-            netloc = urlsplit(url).netloc
+            split = urlsplit(url)
+            netloc = split.netloc
+            own_host = (split.hostname or "").removesuffix(".")
         except ValueError:
             return None
         at = url.find(netloc)
@@ -651,6 +661,9 @@ def match_ats_pattern(url, own_url=False):
     root_only = None   # a workday match that names no career site: kept while an explicit site is looked for
     for pattern, platform, extractor in ATS_URL_PATTERNS:
         text = workday_text if platform == "workday" else url
+        hosts = getattr(extractor, "hosts", None)
+        if own_url and hosts and own_host not in hosts:
+            continue   # "xjobs.ea.com" and "jobs.ea.com.example.org" only contain the host's name
         # Every match is tried: an earlier one may be rejected (e.g. jobs.myworkdayjobs.com)
         # while a later one in the same text is a real tenant.
         for m in pattern.finditer(text):

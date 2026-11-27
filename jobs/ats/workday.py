@@ -282,7 +282,8 @@ def _own_url_key(url):
 
 def _job_key(posting):
     """Identity of a listing across facet slices: its relative path or posting URL, else req id, else its
-    title+location (with any other URL and bullets, so a URL or label shared by postings merges none)."""
+    title+location (with any other URL and bullets, so a URL or label shared by postings merges none),
+    encoded as a JSON list so that no two splits of those fields read the same."""
     if posting.get("externalPath"):
         return posting["externalPath"]
     url = posting.get("externalUrl") or ""
@@ -292,7 +293,7 @@ def _job_key(posting):
     bullets = posting.get("bulletFields") or []
     if bullets and _is_req_id(bullets[0]):
         return bullets[0]
-    return "|".join(map(str, (posting.get("title", ""), posting.get("locationsText", ""), url, *bullets)))
+    return json.dumps([posting.get("title", ""), posting.get("locationsText", ""), url, *bullets], default=str)
 
 
 def _board_is_capped(url, applied, first_jobs, rep, company):
@@ -601,10 +602,13 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     first = leaf["first"]
     asked = 0   # offsets of `offs` already requested
     probed = False   # the cap probe is sent at most once per leaf
+    page1 = first    # page 1's rows, what a cap probe compares against: the cached page, else offset 0's
 
     def follow(data, off):
         """Raise the promise to the higher total of the response at `off`, adding the offsets it now needs."""
-        nonlocal size, probed
+        nonlocal size, probed, page1
+        if off == 0 and not page1:
+            page1 = (data or {}).get("jobPostings")   # kept now: a later page may be the one reporting growth
         total = (data or {}).get("total") or 0
         if not leaf.get("grows") or total <= size:
             return
@@ -612,7 +616,6 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         rep["reported"] = max(rep.get("reported") or 0, total)
         if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is None and not probed:
             # reaching the cap does not make a board capped: ask it, comparing against page 1's rows
-            page1 = first or (off == 0 and data.get("jobPostings"))
             if page1 and not rep.get("blocked") and rep.get("logical", 0) < rep.get("budget", 0.0):
                 probed = True
                 _budget_add(rep, 1)
@@ -1077,11 +1080,12 @@ def _job_req_id(job, external_path, job_url):
     (location), Intel ("Spotlight Job") or Wisconsin (no id bullet), where many jobs then share one id.
     The id is the text after the last "_" of the last externalPath segment. Use the bullet equal to it, or
     to it minus a trailing "-<digits>" (Intel JR0289044-1 -> JR0289044); else the token itself when it is
-    shaped like an id (Wisconsin); else (a word such as "..._Engineer") the first id-shaped bullet, else
-    the token.
+    shaped like an id (Wisconsin); else (a word such as "..._Engineer") the first id-shaped bullet.
     Without a usable path token: bulletFields[0] if it is shaped like an id (no spaces, has a digit);
-    else the URL's own posting id (a numeric last segment or "_R-..."), so legacy ".../1" and ".../2"
-    sharing a text bullet stay apart; else bulletFields[0] (shared landing URL).
+    else the URL's own posting id (a numeric last segment or "_R-...").
+    With no requisition id at all, the posting's own path (externalPath, else its posting URL's key), so
+    postings sharing a word or a text bullet stay apart. Not "": the scan workers drop a job without a
+    job_id. "" only when the posting has no path of its own either.
     """
     bullets = [b for b in (job.get("bulletFields") or []) if isinstance(b, str)]
     segment = (external_path or "").rstrip("/").rsplit("/", 1)[-1]
@@ -1094,7 +1098,7 @@ def _job_req_id(job, external_path, job_url):
                 return cand
         if _is_req_id(token):
             return token
-        return next((b for b in bullets if _is_req_id(b)), token)
+        return next((b for b in bullets if _is_req_id(b)), external_path)
     first = bullets[0] if bullets else ""
     if _is_req_id(first):
         return first
@@ -1105,7 +1109,7 @@ def _job_req_id(job, external_path, job_url):
     if last.isdigit():
         return last
     m = re.search(r"_((?:JR|R)-?\d+(?:-\d+)?)", job_url)
-    return m.group(1) if m else first
+    return m.group(1) if m else external_path or _own_url_key(job_url)
 
 
 def _normalize(job, company, domain, path, slug_info=None):

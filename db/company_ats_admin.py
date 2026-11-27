@@ -94,6 +94,8 @@ def match_job_url(job_url: str) -> "tuple[dict | None, str | None]":
             host = (parsed.hostname or "").lower()
         except ValueError:
             host = ""
+        if host.endswith("."):
+            host = host[:-1]   # one terminal dot names the same host ("nxp.myworkdayjobs.com.")
         if not host.endswith((".myworkdayjobs.com", ".myworkdaysite.com")):
             hit = None
         else:
