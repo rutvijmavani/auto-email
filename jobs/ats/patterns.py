@@ -8,6 +8,7 @@
 
 import re
 import json
+import string
 
 # ─────────────────────────────────────────
 # URL PATTERNS
@@ -32,12 +33,48 @@ _SITEMAP_MARKER = r"(?:sitemap[^\s]*\.xml|feed\.xml)"   # what makes a URL a sit
 _WORKDAY_PATH = r"""([^?&#\s"'<>\\)\]}|`]*)"""
 _WORKDAY_LOCALE = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
 
+_UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
+
+
+def decode_unreserved(segment):
+    """A URL path segment with its percent-encoded unreserved characters decoded ("%45xternal" ->
+    "External"). Every other escape ("%2F", "%20") stays as written. Shared by patterns.py,
+    career_detector.py and build_ats_slug_list.py."""
+    def decoded(m):
+        char = chr(int(m.group(1), 16))
+        return char if char in _UNRESERVED else m.group(0)
+    return re.sub(r"%([0-9A-Fa-f]{2})", decoded, segment)
+
 
 def _workday_site(path):
     """The career site of a Workday link's path: the first segment that is not a locale, without
     trailing sentence punctuation; "" when the path names none."""
-    parts = (p.rstrip(".,;:!") for p in (path or "").split("/"))
+    parts = (decode_unreserved(p).rstrip(".,;:!") for p in (path or "").split("/"))
     return next((p for p in parts if p and not _WORKDAY_LOCALE.match(p)), "")
+
+
+# where one URL or word ends in HTML/JS/JSON text (literal escapes and quote/angle entities included)
+_URL_TOKEN_BREAK = re.compile(
+    r'''\\[nrt]|\\u00(?:22|27|3[ce])|&(?:quot|apos|lt|gt|nbsp|#0?3[49]|#x2[27]);|[\s"'<>()\[\]{}|`]''',
+    re.IGNORECASE,
+)
+# all that may stand between that break and a URL's host: "href=" / "Careers:", a scheme or "//", user info
+_URL_AUTHORITY_LEAD = re.compile(
+    r'(?:[^/?#&@]*[=:])?(?:(?:https?:)?(?:\\*/){2}(?:[^/?#\\]*@)?)?', re.IGNORECASE,
+)
+URL_LEAD_WINDOW = 2048   # a longer unbroken run before a host is the inside of a URL
+
+
+def is_url_authority(text, start):
+    """True when the host at `start` is the enclosing URL's own host (or stands alone), not text inside
+    another URL's path or query, or the domain of an email address. Shared by patterns.py and
+    career_detector.py."""
+    lo = max(0, start - URL_LEAD_WINDOW)
+    parts = _URL_TOKEN_BREAK.split(text[lo:start])
+    if lo and len(parts) == 1:
+        return False
+    lead = re.sub(r'&#(?:x2f|47);', '/', parts[-1], flags=re.IGNORECASE)
+    return bool(_URL_AUTHORITY_LEAD.fullmatch(lead))
 
 
 def _make_patterns():
@@ -172,7 +209,7 @@ def _make_patterns():
     patterns.append((
         re.compile(
             # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
-            r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com/"
+            r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com(?::\d+)?/"
             r"(?:[a-z]{2}[-_][A-Z]{2}/)?"   # optional locale: en-US, fr-FR, pt_BR
             r"recruiting/([a-z0-9-]+)" + URL_SEGMENT_END +   # the whole tenant segment
             r"(?:/" + _WORKDAY_PATH + r")?",   # the site part is optional: the URL may end at the tenant
@@ -590,7 +627,9 @@ def match_ats_pattern(url, own_url=False):
                     continue
                 slug = json.dumps({"url": url.split("#", 1)[0]})   # the query may select the feed
             if slug and bare:
-                if root_only is None:
+                # a root says nothing but its host, so it counts only as a URL's own host or alone,
+                # not as the domain of an email address or as text inside another URL
+                if root_only is None and is_url_authority(url, m.start()):
                     root_only = {"platform": platform, "slug": slug}
                 continue
             if slug:
@@ -768,8 +807,7 @@ def _decode_google_redirect(url):
     """
     if not url:
         return url
-    from urllib.parse import unquote
     redirect = _redirect_parts(url)
     if redirect and _is_google_origin(redirect[0]):
-        return unquote(redirect[1])
+        return redirect[1]   # parse_qs already decoded it once; the target keeps its own escapes
     return url

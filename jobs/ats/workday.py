@@ -62,11 +62,12 @@ def wd_present(wd, site=None):
     """
     True when a stored `wd` / `_wd` value is usable (design: presence check, 2026-11-23).
 
-    The key must exist (None = missing = error) but the value may be the empty string, which means
-    the bare host {slug}.myworkdayjobs.com (NXP). `myworkdaysite` tenants build the host FROM wd, so
-    an empty value is never valid for them. Every guard that used a truthiness test on wd/_wd uses this.
+    The value must be a string (None = missing, and false or a number in stored JSON, are errors) but
+    it may be the empty string, which means the bare host {slug}.myworkdayjobs.com (NXP).
+    `myworkdaysite` tenants build the host FROM wd, so an empty value is never valid for them.
+    Every guard that used a truthiness test on wd/_wd uses this.
     """
-    if wd is None:
+    if not isinstance(wd, str):
         return False
     if wd == "" and site == "myworkdaysite":
         return False
@@ -1061,7 +1062,9 @@ def _job_req_id(job, external_path, job_url):
     Requisition id of a listing (design P1). bulletFields[0] is the id on most tenants but not on Motorola
     (location), Intel ("Spotlight Job") or Wisconsin (no id bullet), where many jobs then share one id.
     The id is the text after the last "_" of the last externalPath segment. Use the bullet equal to it, or
-    to it minus a trailing "-<digits>" (Intel JR0289044-1 -> JR0289044); else the token itself (Wisconsin).
+    to it minus a trailing "-<digits>" (Intel JR0289044-1 -> JR0289044); else the token itself when it is
+    shaped like an id (Wisconsin); else (a word such as "..._Engineer") the first id-shaped bullet, else
+    the token.
     Without a usable path token: bulletFields[0] if it is shaped like an id (no spaces, has a digit);
     else the URL's own posting id (a numeric last segment or "_R-..."), so legacy ".../1" and ".../2"
     sharing a text bullet stay apart; else bulletFields[0] (shared landing URL).
@@ -1075,7 +1078,9 @@ def _job_req_id(job, external_path, job_url):
         for cand in (token, base):
             if cand in bullets:
                 return cand
-        return token
+        if _is_req_id(token):
+            return token
+        return next((b for b in bullets if _is_req_id(b)), token)
     first = bullets[0] if bullets else ""
     if _is_req_id(first):
         return first

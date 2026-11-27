@@ -273,31 +273,11 @@ def _extract_api_paths(bundle_text):
 # Each takes raw text, returns {"platform": ..., "slug": ...} or None
 # ─────────────────────────────────────────────────────────────────────────────
 
+from jobs.ats.patterns import URL_LEAD_WINDOW as _URL_LEAD_WINDOW
 from jobs.ats.patterns import URL_SEGMENT_END as _URL_SEGMENT_END
 from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
-
-
-# where one URL or word ends in HTML/JS/JSON text (literal escapes and quote/angle entities included)
-_URL_TOKEN_BREAK = re.compile(
-    r'''\\[nrt]|\\u00(?:22|27|3[ce])|&(?:quot|apos|lt|gt|nbsp|#0?3[49]|#x2[27]);|[\s"'<>()\[\]{}|`]''',
-    re.IGNORECASE,
-)
-# all that may stand between that break and a URL's host: "href=" / "Careers:", a scheme or "//", user info
-_URL_AUTHORITY_LEAD = re.compile(
-    r'(?:[^/?#&@]*[=:])?(?:(?:https?:)?(?:\\*/){2}(?:[^/?#\\]*@)?)?', re.IGNORECASE,
-)
-_URL_LEAD_WINDOW = 2048   # a longer unbroken run before a host is the inside of a URL
-
-
-def _is_url_authority(text, start):
-    """True when the host at `start` is the enclosing URL's own host (or stands alone), not text inside
-    another URL's path or query, or the domain of an email address."""
-    lo = max(0, start - _URL_LEAD_WINDOW)
-    parts = _URL_TOKEN_BREAK.split(text[lo:start])
-    if lo and len(parts) == 1:
-        return False
-    lead = re.sub(r'&#(?:x2f|47);', '/', parts[-1], flags=re.IGNORECASE)
-    return bool(_URL_AUTHORITY_LEAD.fullmatch(lead))
+from jobs.ats.patterns import decode_unreserved as _decode_unreserved
+from jobs.ats.patterns import is_url_authority as _is_url_authority
 
 
 # a scheme (and optional user info) written directly before a host
@@ -329,7 +309,7 @@ def _extract_workday(text):
     ):
         if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:
             continue   # jobs./apply./www. aggregator hosts are not tenants
-        path = m.group(3) or ""
+        path = _decode_unreserved(m.group(3) or "")
         if re.fullmatch(r'[a-z]{2}[-_][A-Z]{2}', path):
             path = ""   # locale-only URL (e.g. /en-US/): the locale is not the site
         if not path:
@@ -346,12 +326,12 @@ def _extract_workday(text):
     for m in re.finditer(
         # the locale may sit before /recruiting/ or after the tenant
         # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
-        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)'
+        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com(?::\d+)?/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)'
         + _URL_SEGMENT_END +   # the whole tenant segment; the URL may end right after it
         r'(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*))?',
         text, re.IGNORECASE,
     ):
-        path = m.group(3) or ""
+        path = _decode_unreserved(m.group(3) or "")
         if re.fullmatch(r'[a-z]{2}[-_][A-Z]{2}', path):
             path = ""   # locale-only URL: the locale is not the site
         info = {"slug": m.group(2), "wd": m.group(1), "path": path or "careers", "site": "myworkdaysite"}

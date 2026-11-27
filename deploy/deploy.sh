@@ -71,6 +71,11 @@ PREVIOUS_SHA=$(git rev-parse HEAD)
 # ── Shared rollback helper ────────────────────────────────────────────────────
 _rollback_to_previous() {
     echo "  [ROLLBACK] Reverting to $PREVIOUS_SHA..."
+    # wrappers regenerated in this deploy are pending again until they are restored below, so a
+    # rollback that fails or is interrupted leaves the flag for the next deploy
+    if ${_CRON_REGENERATED:-false}; then
+        touch "$_CRON_PENDING_FLAG" || echo "  [WARN] could not set $_CRON_PENDING_FLAG"
+    fi
     git reset --hard HEAD 2>/dev/null || true
     local _checkout_ok=true
     if ! git checkout -B "$_BRANCH" "$PREVIOUS_SHA"; then
@@ -86,8 +91,11 @@ _rollback_to_previous() {
         sudo systemctl daemon-reload || true
         # wrappers/crontab regenerated from the new setup_cron.sh must go back with the code
         if ${_CRON_REGENERATED:-false}; then
-            bash "$PROJECT_DIR/setup_cron.sh" \
-                || echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually"
+            if bash "$PROJECT_DIR/setup_cron.sh"; then
+                rm -f "$_CRON_PENDING_FLAG"
+            else
+                echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually (the next deploy retries)"
+            fi
         fi
     else
         echo "  [WARN] Skipping pip install and unit sync — code state unknown"
