@@ -314,8 +314,14 @@ def _is_site_link(text, start):
     return bool(_URL_OWN_SCHEME.search(lead))
 
 
+# a "/" written as JSON ("\/", "/", also double-escaped) or as an HTML entity.
+# The lookbehind starts a match only at the head of a backslash run: no rescanning of a long run.
+_ENCODED_SLASH = re.compile(r'(?<!\\)\\+(?:/|u002f)|&#(?:x2f|47);', re.IGNORECASE)
+
+
 def _extract_workday(text):
     # wd group optional: bare host {tenant}.myworkdayjobs.com is stored as "wd": "".
+    text = _ENCODED_SLASH.sub('/', text)   # an escaped path still names its career site
     root_only = None   # fallback: a match that names no career site (bare host or locale-only)
     for m in re.finditer(
         r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?::\d+)?(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]+)?)?',

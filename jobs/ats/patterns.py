@@ -27,6 +27,18 @@ URL_SEGMENT_END = r"""(?=$|[/?#&\s"'<>\\)\]}|`]|[.,;:!](?![a-z0-9]))"""
 
 _SITEMAP_MARKER = r"(?:sitemap[^\s]*\.xml|feed\.xml)"   # what makes a URL a sitemap / XML feed
 
+# The path of a Workday link: it ends at the query, the fragment, or what closes a link in text or
+# markup (a Markdown ")" included).
+_WORKDAY_PATH = r"""([^?&#\s"'<>\\)\]}|`]*)"""
+_WORKDAY_LOCALE = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
+
+
+def _workday_site(path):
+    """The career site of a Workday link's path: the first segment that is not a locale, without
+    trailing sentence punctuation; "" when the path names none."""
+    parts = (p.rstrip(".,;:!") for p in (path or "").split("/"))
+    return next((p for p in parts if p and not _WORKDAY_LOCALE.match(p)), "")
+
 
 def _make_patterns():
     patterns = []
@@ -108,37 +120,29 @@ def _make_patterns():
     #   e.g. /en-US/NVIDIAExternalCareerSite/job/...
     #        /NVIDIAExternalCareerSite/job/...
     # We always want the career site name, not the locale prefix.
-    _LOCALE_PATTERN = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
-
     def _workday_slug(m):
         tenant = m.group(1).lower()
         wd     = (m.group(2) or "").lower()   # "" = bare host ({tenant}.myworkdayjobs.com)
         if not wd and tenant in WORKDAY_NON_TENANT:
             return None
-        raw_path = (m.group(3) or "").rstrip("/")   # no path at all = the bare host
-        parts    = [p for p in raw_path.split("/") if p]
-        # Skip locale prefix (en-US, fr-FR, zh-CN, etc.)
-        path = next(
-            (p for p in parts if not _LOCALE_PATTERN.match(p)),
-            "careers"   # locale-only path: never use the locale as the site
-        )
         return json.dumps({
             "slug": tenant,
             "wd":   wd,
-            "path": path or "careers",
+            # bare host or locale-only path: never use the locale as the site
+            "path": _workday_site(m.group(3)) or "careers",
         })
 
     def _workday_root_only(m):
         """True when the match names no career site (bare host or locale-only path)."""
-        parts = [p for p in (m.group(3) or "").split("/") if p]
-        return not any(not _LOCALE_PATTERN.match(p) for p in parts)
+        return not _workday_site(m.group(3))
 
     _workday_slug.root_only = _workday_root_only
 
     patterns.append((
         re.compile(
             # (?<![a-z0-9.-]) keeps "a.b.myworkdayjobs.com" from reading "b" as a bare tenant.
-            r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?::\d+)?(?:/([^?&#\s\"'<>]*))?",
+            r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?::\d+)?"
+            r"(?:/" + _WORKDAY_PATH + r")?",
             re.IGNORECASE
         ),
         "workday",
@@ -148,27 +152,20 @@ def _make_patterns():
     # Workday (alternate domain) — {wd}.myworkdaysite.com/recruiting/{tenant}/{career_site}
     # e.g. wd1.myworkdaysite.com/recruiting/fmr/FidelityCareers/...
     # API: wd1.myworkdaysite.com/wday/cxs/{tenant}/{career_site}/jobs
-    _LOCALE_PATTERN2 = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
-
     def _workdaysite_slug(m):
         wd     = m.group(1).lower()
         tenant = m.group(2).lower()
-        parts  = [p for p in (m.group(3) or "").split("/") if p]
-        path   = next(
-            (p for p in parts if not _LOCALE_PATTERN2.match(p)),
-            "careers"   # locale-only path: never use the locale as the site
-        )
         return json.dumps({
             "slug": tenant,
             "wd":   wd,
-            "path": path,
+            # nothing or only a locale: never use the locale as the site
+            "path": _workday_site(m.group(3)) or "careers",
             "site": "myworkdaysite",  # flag different base URL
         })
 
     def _workdaysite_root_only(m):
         """True when the match names no career site (nothing or only a locale after the tenant)."""
-        parts = [p for p in (m.group(3) or "").split("/") if p]
-        return not any(not _LOCALE_PATTERN2.match(p) for p in parts)
+        return not _workday_site(m.group(3))
 
     _workdaysite_slug.root_only = _workdaysite_root_only
 
@@ -178,7 +175,7 @@ def _make_patterns():
             r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com/"
             r"(?:[a-z]{2}[-_][A-Z]{2}/)?"   # optional locale: en-US, fr-FR, pt_BR
             r"recruiting/([a-z0-9-]+)" + URL_SEGMENT_END +   # the whole tenant segment
-            r"(?:/([^?&#\s\"'<>]*))?",   # the site part is optional: the URL may end at the tenant
+            r"(?:/" + _WORKDAY_PATH + r")?",   # the site part is optional: the URL may end at the tenant
             re.IGNORECASE
         ),
         "workday",

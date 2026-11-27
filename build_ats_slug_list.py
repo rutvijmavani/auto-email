@@ -196,7 +196,9 @@ def get_recent_crawls(n=CRAWLS_TO_USE):
 # Bump whenever MAIN_QUERY changes: it is part of the cached CSV name, so rows produced by an older
 # query are never reused as the current result (q2 = Workday bare hosts added).
 # Forward-only: it does not reopen crawls already in scanned_crawls, so a changed query first runs on
-# the next new crawl. To rescan by hand, delete the wanted crawls' scanned_crawls rows.
+# the next new crawl. To rescan by hand, delete the wanted crawls' scanned_crawls rows: that only makes
+# a crawl eligible again if its ID is in the current CRAWLS_TO_USE (3) crawl window. Reprocessing it
+# does not necessarily rerun Athena: a CSV cached the same day for this revision is reused instead.
 ATHENA_QUERY_REV = "q2"
 
 MAIN_QUERY = """
@@ -951,7 +953,7 @@ def _save_brave_to_db(platform_slugs, crawl_id):
 
 def run_cleanup(window_crawls):
     """
-    Archive and delete slugs not in sliding window.
+    Archive and delete slugs older than the sliding window.
     Only affects source='crawl' rows.
     """
     from db.ats_companies import remove_stale_crawls
@@ -969,7 +971,7 @@ def run_cleanup(window_crawls):
         print(f"\n[CLEANUP] Archived {archived:,} slugs → "
               f"data/ats_archive.csv.gz")
         print(f"[CLEANUP] Deleted {deleted:,} stale slugs "
-              f"from DB (not in last {CRAWLS_TO_USE} crawls)")
+              f"from DB (older than the {CRAWLS_TO_USE}-crawl window)")
     else:
         logger.info("Cleanup: no stale slugs to remove")
         print(f"\n[CLEANUP] No stale slugs to remove")

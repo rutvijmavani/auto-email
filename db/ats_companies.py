@@ -321,12 +321,14 @@ def delete_company(platform, slug):
 
 def get_stale_slugs(keep_crawls):
     """
-    Get slugs not seen in recent crawls.
+    Get slugs last seen before the oldest crawl in the window.
+    Crawl IDs (CC-MAIN-YYYY-WW) sort in date order, so a row seen in a
+    crawl newer than the window (a stale or fallback window) is kept.
     Only returns source='crawl' rows — detection/manual
     entries are never subject to sliding window cleanup.
 
     Args:
-        keep_crawls: list of crawl IDs to keep
+        keep_crawls: list of crawl IDs in the active window
 
     Returns:
         list of row dicts to archive then delete
@@ -334,17 +336,16 @@ def get_stale_slugs(keep_crawls):
     if not keep_crawls:
         return []
 
-    placeholders = ",".join("?" * len(keep_crawls))
     conn = get_discovery_conn()
     try:
-        rows = conn.execute(f"""
+        rows = conn.execute("""
             SELECT platform, slug, company_name,
                    website, crawl_source,
                    last_seen_crawl, source, first_seen
             FROM ats_companies
-            WHERE last_seen_crawl NOT IN ({placeholders})
+            WHERE last_seen_crawl < ?
             AND source = 'crawl'
-        """, keep_crawls).fetchall()
+        """, (min(keep_crawls),)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -386,7 +387,7 @@ def archive_stale_slugs(stale_rows):
 
 def remove_stale_crawls(keep_crawls):
     """
-    Archive then delete slugs not in sliding window.
+    Archive then delete slugs older than the sliding window.
 
     Flow:
       1. Find stale slugs (source='crawl' only)
@@ -404,14 +405,13 @@ def remove_stale_crawls(keep_crawls):
     archived = archive_stale_slugs(stale_rows)
 
     # Delete from DB
-    placeholders = ",".join("?" * len(keep_crawls))
     conn = get_discovery_conn()
     try:
-        result = conn.execute(f"""
+        result = conn.execute("""
             DELETE FROM ats_companies
-            WHERE last_seen_crawl NOT IN ({placeholders})
+            WHERE last_seen_crawl < ?
             AND source = 'crawl'
-        """, keep_crawls)
+        """, (min(keep_crawls),))
         conn.commit()
         deleted = result.rowcount
     finally:

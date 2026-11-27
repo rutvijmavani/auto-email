@@ -253,8 +253,14 @@ def fetch_jobs(slug_info, company, stop_check=None):
     ))
 
 
+def _is_req_id(text):
+    """A bulletFields value shaped like a requisition id: no spaces, has a digit."""
+    return isinstance(text, str) and bool(re.fullmatch(r"\S*\d\S*", text))
+
+
 def _job_key(posting):
-    """Identity of a listing across facet slices: its relative path, else req id, else title+location."""
+    """Identity of a listing across facet slices: its relative path or posting URL, else req id, else its
+    title+location (with any other URL and bullets, so a URL or label shared by postings merges none)."""
     if posting.get("externalPath"):
         return posting["externalPath"]
     url = posting.get("externalUrl") or ""
@@ -273,16 +279,19 @@ def _job_key(posting):
         own = bare
     else:
         own = ""
-    return (own
-            or (posting.get("bulletFields") or [""])[0]
-            or url
-            or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
+    if own:
+        return own
+    bullets = posting.get("bulletFields") or []
+    if bullets and _is_req_id(bullets[0]):
+        return bullets[0]
+    return "|".join(map(str, (posting.get("title", ""), posting.get("locationsText", ""), url, *bullets)))
 
 
 def _board_is_capped(url, applied, first_jobs, rep, company):
     """
-    Per-tenant yes/no cap probe (design P2). Called only when page 1 of a query reports a total at/above
-    WORKDAY_RESULT_CAP. Requests the page at offset WORKDAY_RESULT_CAP and compares it with page 1: a
+    Per-tenant yes/no cap probe (design P2). Called only when a query's total is at/above
+    WORKDAY_RESULT_CAP: on page 1 by the planner, or on a later page of a flat board that grew to it
+    (_fetch_leaf). Requests the page at offset WORKDAY_RESULT_CAP and compares it with page 1: a
     capped tenant serves page 1 again (offsets past the cap repeat it), an uncapped one (BofA, Micron,
     CVS) serves the next real page, or none when the board is exactly cap-sized.
 
@@ -552,8 +561,10 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
 
     A leaf marked "grows" (the flat board) takes a higher total reported by any of its pages: the new
     count becomes its promise and rep["reported"], and the extra offsets are paged on the request budget
-    already set. Past WORKDAY_RESULT_CAP that needs a tenant probed as uncapped; otherwise paging stops at
-    the cap and sets rep["capped"]. A total of 0 (later pages often report none) or a lower one is ignored.
+    already set. Past WORKDAY_RESULT_CAP that needs a tenant probed as uncapped: growth that reaches the cap
+    on an unprobed tenant probes it (once, one budgeted request). If the probe says capped, fails, or cannot
+    be sent, paging stops at the cap and sets rep["capped"]. A total of 0 (later pages often report none) or
+    a lower one is ignored.
     """
     got = {}
     leaf_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
@@ -579,14 +590,23 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     size = leaf["K"]   # the promised count
     first = leaf["first"]
     asked = 0   # offsets of `offs` already requested
+    probed = False   # the cap probe is sent at most once per leaf
 
-    def follow(data):
-        """Raise the promise to a response's higher total, adding the offsets it now needs."""
-        nonlocal size
+    def follow(data, off):
+        """Raise the promise to the higher total of the response at `off`, adding the offsets it now needs."""
+        nonlocal size, probed
         total = (data or {}).get("total") or 0
         if not leaf.get("grows") or total <= size:
             return
         rep["reported"] = total
+        if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is None and not probed:
+            # reaching the cap does not make a board capped: ask it, comparing against page 1's rows
+            page1 = first or (off == 0 and data.get("jobPostings"))
+            if page1 and not rep.get("blocked") and rep.get("logical", 0) < rep.get("budget", 0.0):
+                probed = True
+                _budget_add(rep, 1)
+                rep["logical"] = rep.get("logical", 0) + 1   # the probe is one request
+                _board_is_capped(url, leaf["applied"], page1, rep, company)   # caches rep["capped_board"]
         if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is not False:
             rep["capped"] = True   # offsets past the cap may repeat page 1: page up to it only
             total = max(size, WORKDAY_RESULT_CAP)
@@ -601,7 +621,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                 break
             asked = i + 1
             data = _post(url, leaf["applied"], off, company, rep)
-            follow(data)
+            follow(data, off)
             expect = min(WORKDAY_PAGE_SIZE, size - off)   # the last page is legitimately short
             jobs = list(data.get("jobPostings") or []) if data else []
             retried = False
@@ -617,7 +637,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                 retried = True
                 _budget_add(rep, 1)
                 again = _post(url, leaf["applied"], off, company, rep)
-                follow(again)
+                follow(again, off)
                 if again:
                     pos = {_job_key(p): n for n, p in enumerate(jobs)}
                     for p in again.get("jobPostings") or []:
@@ -754,6 +774,7 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
         term = words.most_common(1)[0][0]
         tried.add(term)
         new, off, ended = {}, 0, False
+        seen = set()   # every key this term returned: all lie inside the node, titled yet or not
         try:
             while off < WORKDAY_RESULT_CAP and not ended and allowance - spent >= 1 and gap(len(new)) > tol:
                 chunk = min(WORKDAY_SEARCH_CHUNK_PAGES, int(allowance - spent))   # never past the allowance
@@ -772,6 +793,7 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
                     for p in jobs:
                         rows += 1
                         k = _job_key(p)
+                        seen.add(k)
                         if not p.get("title"):
                             # kept so a later titled copy can replace it; a copy already titled counts
                             p = merged.setdefault(k, p)
@@ -787,8 +809,8 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
             have |= set(new)
             for k, p in new.items():
                 _merge_row(merged, k, p)
-            if new:
-                leaf_got.append((dict(applied), set(new)))
+            if seen:
+                leaf_got.append((dict(applied), seen))
         idle = 0 if new else idle + 1
         logger.info("workday search: %r term=%r new=%d unique_now=%d gap=%d applied=%s",
                     company, term, len(new), len(have), size - len(have), applied)
@@ -1055,7 +1077,7 @@ def _job_req_id(job, external_path, job_url):
                 return cand
         return token
     first = bullets[0] if bullets else ""
-    if re.fullmatch(r"\S*\d\S*", first):
+    if _is_req_id(first):
         return first
     try:
         last = urlparse(job_url).path.rstrip("/").rsplit("/", 1)[-1]
