@@ -274,26 +274,12 @@ def _extract_api_paths(bundle_text):
 # ─────────────────────────────────────────────────────────────────────────────
 
 from jobs.ats.patterns import ENCODED_SLASH as _ENCODED_SLASH
-from jobs.ats.patterns import URL_LEAD_WINDOW as _URL_LEAD_WINDOW
 from jobs.ats.patterns import URL_LOCALE_SEGMENT as _URL_LOCALE_SEGMENT
 from jobs.ats.patterns import URL_SEGMENT_END as _URL_SEGMENT_END
 from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
+from jobs.ats.patterns import is_site_link as _is_site_link
 from jobs.ats.patterns import is_url_authority as _is_url_authority
 from jobs.ats.patterns import workday_site as _workday_site
-
-
-# a scheme (and optional user info) written directly before a host
-_URL_OWN_SCHEME = re.compile(r'''https?:(?:\\*/){2}(?:[^/?#\\\s"'<>@]*@)?\Z''', re.IGNORECASE)
-
-
-def _is_site_link(text, start):
-    """True when a host that is followed by a career site is a link: the enclosing URL's own host, or a
-    whole link with its own scheme carried inside another ("?u=https://..."). Host-like text that is
-    merely part of another URL's path or query is neither."""
-    if _is_url_authority(text, start):
-        return True
-    lead = re.sub(r'&#(?:x2f|47);', '/', text[max(0, start - _URL_LEAD_WINDOW):start], flags=re.IGNORECASE)
-    return bool(_URL_OWN_SCHEME.search(lead))
 
 
 # the first two path segments of a Workday link: the career site, perhaps after a locale

@@ -3,11 +3,17 @@ from unittest.mock import patch
 
 import pytest
 
-from jobs.ats import workday
+from jobs.ats import base, workday
 from jobs.ats.fetch_report import STOP_EARLY_EXIT, STOP_NO_CONFIG, STOP_REQUEST_FAILED
 
 SLUG = {"slug": "acme", "wd": "wd5", "path": "Ext"}
 PAGE = 20
+
+
+@pytest.fixture(autouse=True)
+def _no_stale_challenge():
+    """The mocked requests never reset the thread-local challenge flag, so no earlier test may leave it set."""
+    base._post_state.challenge = False
 
 
 class Board:
@@ -165,7 +171,7 @@ def test_country_filter_is_applied_to_every_request():
     assert all(c.get("appliedFacets") == {"locationCountry": ["us-id"]} for c in board.calls[1:])
 
 
-@pytest.mark.parametrize("window_max, by_search", [(workday.WORKDAY_WINDOW_MAX, False), (0, True)],
+@pytest.mark.parametrize("window_max, by_search", [(2, False), (0, True)],
                          ids=["window", "search"])
 def test_country_filter_survives_split_and_recovery(window_max, by_search):
     # 2300 US jobs, 100 of them without the split facet (recovery needed) + non-US jobs sharing facet values

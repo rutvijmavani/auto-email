@@ -86,6 +86,21 @@ def is_url_authority(text, start):
     return bool(_URL_AUTHORITY_LEAD.fullmatch(lead))
 
 
+# a scheme (and optional user info) written directly before a host
+_URL_OWN_SCHEME = re.compile(r'''https?:(?:\\*/){2}(?:[^/?#\\\s"'<>@]*@)?\Z''', re.IGNORECASE)
+
+
+def is_site_link(text, start):
+    """True when a host that is followed by a career site is a link: the enclosing URL's own host, or a
+    whole link with its own scheme carried inside another ("?u=https://..."). Host-like text that is
+    merely part of another URL's path or query is neither. Shared by patterns.py and
+    career_detector.py."""
+    if is_url_authority(text, start):
+        return True
+    lead = re.sub(r'&#(?:x2f|47);', '/', text[max(0, start - URL_LEAD_WINDOW):start], flags=re.IGNORECASE)
+    return bool(_URL_OWN_SCHEME.search(lead))
+
+
 def _make_patterns():
     patterns = []
 
@@ -647,6 +662,8 @@ def match_ats_pattern(url, own_url=False):
                     root_only = {"platform": platform, "slug": slug}
                 continue
             if slug:
+                if platform == "workday" and not is_site_link(text, m.start()):
+                    continue   # host-like text inside another URL, or an email domain
                 return {"platform": platform, "slug": slug}
 
     return root_only

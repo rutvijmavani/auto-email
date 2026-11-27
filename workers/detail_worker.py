@@ -601,7 +601,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         # jobs, custom jobs that already have a description) should fall through.
         _pre_missing = [
             k for k in _REQUIRED_DETAIL_KEYS.get(platform, [])
-            if not job.get(k)
+            if not detail_key_present(platform, k, job)
         ]
         if (
             not detail_attempted

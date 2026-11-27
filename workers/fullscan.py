@@ -611,12 +611,17 @@ def _complete_fullscan_db(
     duration_s: float,
     prev_avg_duration_s: float = _AVG_DURATION_SEED,
     next_scan_ts: float = 0.0,
+    keep_checkpoint: bool = False,
 ) -> bool:
     """
     Update company_poll_stats on successful full scan completion.
 
     Sets last_full_scan_at, next_full_scan_at, clears interrupted flag,
     increments total_new_jobs, and updates the scan duration EMA.
+
+    keep_checkpoint: leave full_scan_interrupted and the page checkpoint of an
+        existing row as they are (a run that fetched nothing must not make the
+        next scan start fresh and wipe the partial NEW bloom).
 
     next_scan_ts: exact Unix timestamp written to Redis by _atomic_schedule.
         When provided (non-zero), it is persisted directly so the DB and Redis
@@ -653,16 +658,18 @@ def _complete_fullscan_db(
                 ats_platform             = EXCLUDED.ats_platform,
                 last_full_scan_at        = NOW(),
                 next_full_scan_at        = to_timestamp(%s::double precision),
-                full_scan_interrupted    = FALSE,
-                interrupted_at_page      = NULL,
-                interrupted_at           = NULL,
                 total_new_jobs           = COALESCE(company_poll_stats.total_new_jobs, 0) + %s,
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
+                full_scan_interrupted    = CASE WHEN %s THEN company_poll_stats.full_scan_interrupted
+                                                ELSE FALSE END,
+                interrupted_at_page      = CASE WHEN %s THEN company_poll_stats.interrupted_at_page END,
+                interrupted_at           = CASE WHEN %s THEN company_poll_stats.interrupted_at END,
                 updated_at               = NOW()
             """
             _params = (company, platform, next_scan_ts, new_jobs, int(duration_s), new_avg,
-                       next_scan_ts, new_jobs, int(duration_s), new_avg)
+                       next_scan_ts, new_jobs, int(duration_s), new_avg,
+                       keep_checkpoint, keep_checkpoint, keep_checkpoint)
         else:
             _sql = """
             INSERT INTO company_poll_stats
@@ -679,16 +686,18 @@ def _complete_fullscan_db(
                 ats_platform             = EXCLUDED.ats_platform,
                 last_full_scan_at        = NOW(),
                 next_full_scan_at        = NOW() + (%s * INTERVAL '1 second'),
-                full_scan_interrupted    = FALSE,
-                interrupted_at_page      = NULL,
-                interrupted_at           = NULL,
                 total_new_jobs           = COALESCE(company_poll_stats.total_new_jobs, 0) + %s,
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
+                full_scan_interrupted    = CASE WHEN %s THEN company_poll_stats.full_scan_interrupted
+                                                ELSE FALSE END,
+                interrupted_at_page      = CASE WHEN %s THEN company_poll_stats.interrupted_at_page END,
+                interrupted_at           = CASE WHEN %s THEN company_poll_stats.interrupted_at END,
                 updated_at               = NOW()
             """
             _params = (company, platform, interval_s, new_jobs, int(duration_s), new_avg,
-                       interval_s, new_jobs, int(duration_s), new_avg)
+                       interval_s, new_jobs, int(duration_s), new_avg,
+                       keep_checkpoint, keep_checkpoint, keep_checkpoint)
 
         conn.execute(_sql, _params)
         conn.commit()
@@ -1394,6 +1403,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 duration_s          = duration_s,
                 prev_avg_duration_s = avg_duration_s,   # DB function recomputes EMA
                 next_scan_ts        = next_scan_at,     # exact Redis score → no drift
+                # nothing was fetched: an interrupted scan still resumes with its partial bloom
+                keep_checkpoint     = _no_config,
             )
 
             if db_ok:

@@ -557,8 +557,8 @@ def _plan_board(url, company, rep, base=None):
 def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     """
     Page one leaf sequentially. Returns {job_key: posting}. The early-exit gate (fresh per leaf) sees
-    every non-final page; True ends the leaf and sets rep["early"]. Pages that failed or came back short
-    are requested once more; a leaf that still does not match its promised count is recorded in
+    every non-final page that adds a job to this leaf (a replayed page cannot confirm the exit); True ends
+    the leaf and sets rep["early"]. Pages that failed or came back short are requested once more; a leaf that still does not match its promised count is recorded in
     rep["leaf_mismatch"] (leaf totals are exact).
 
     A leaf marked "grows" (the flat board) takes a higher total reported by any of its pages: the new
@@ -572,14 +572,16 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     leaf_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
 
     def take(jobs, final):
+        # novel = the page brings a job this leaf has not delivered (other leaves do not count)
+        novel = any(_job_key(p) not in got for p in jobs)
         for p in jobs:
             _merge_row(got, _job_key(p), p)
         if leaf_gate is None or norm is None:
             return False
         seen = [j for j in map(norm, jobs) if j]
-        if final or len(seen) != len(jobs):
-            # not a page the gate may stop on (last, short, retried or with titleless rows),
-            # but an unseen job on it still breaks the streak
+        if final or not novel or len(seen) != len(jobs):
+            # not a page the gate may stop on (last, short, retried, replayed or with titleless
+            # rows), but an unseen job on it still breaks the streak
             if hasattr(leaf_gate, "reset_if_unseen"):
                 leaf_gate.reset_if_unseen(seen)
             return False
