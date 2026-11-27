@@ -273,11 +273,13 @@ def _extract_api_paths(bundle_text):
 # Each takes raw text, returns {"platform": ..., "slug": ...} or None
 # ─────────────────────────────────────────────────────────────────────────────
 
+from jobs.ats.patterns import ENCODED_SLASH as _ENCODED_SLASH
 from jobs.ats.patterns import URL_LEAD_WINDOW as _URL_LEAD_WINDOW
+from jobs.ats.patterns import URL_LOCALE_SEGMENT as _URL_LOCALE_SEGMENT
 from jobs.ats.patterns import URL_SEGMENT_END as _URL_SEGMENT_END
 from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
-from jobs.ats.patterns import decode_unreserved as _decode_unreserved
 from jobs.ats.patterns import is_url_authority as _is_url_authority
+from jobs.ats.patterns import workday_site as _workday_site
 
 
 # a scheme (and optional user info) written directly before a host
@@ -294,9 +296,8 @@ def _is_site_link(text, start):
     return bool(_URL_OWN_SCHEME.search(lead))
 
 
-# a "/" written as JSON ("\/", "/", also double-escaped) or as an HTML entity.
-# The lookbehind starts a match only at the head of a backslash run: no rescanning of a long run.
-_ENCODED_SLASH = re.compile(r'(?<!\\)\\+(?:/|u002f)|&#(?:x2f|47);', re.IGNORECASE)
+# the first two path segments of a Workday link: the career site, perhaps after a locale
+_WORKDAY_SITE_SEGMENTS = r'((?:[a-zA-Z0-9_%-]+/)?[a-zA-Z0-9_%-]*)'
 
 
 def _extract_workday(text):
@@ -304,14 +305,13 @@ def _extract_workday(text):
     text = _ENCODED_SLASH.sub('/', text)   # an escaped path still names its career site
     root_only = None   # fallback: a match that names no career site (bare host or locale-only)
     for m in re.finditer(
-        r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?::\d+)?(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]+)?)?',
+        r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])(?::\d+)?'
+        r'(?:/' + _WORKDAY_SITE_SEGMENTS + r')?',
         text, re.IGNORECASE,
     ):
         if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:
             continue   # jobs./apply./www. aggregator hosts are not tenants
-        path = _decode_unreserved(m.group(3) or "")
-        if re.fullmatch(r'[a-z]{2}[-_][A-Z]{2}', path):
-            path = ""   # locale-only URL (e.g. /en-US/): the locale is not the site
+        path = _workday_site(m.group(3))   # "" for a locale-only URL (e.g. /en-US/)
         if not path:
             # a root says nothing but its host, so it counts only as a URL's own host
             if root_only is None and _is_url_authority(text, m.start()):
@@ -326,14 +326,13 @@ def _extract_workday(text):
     for m in re.finditer(
         # the locale may sit before /recruiting/ or after the tenant
         # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
-        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com(?::\d+)?/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?recruiting/([a-z0-9-]+)'
+        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com(?::\d+)?/(?:(?-i:' + _URL_LOCALE_SEGMENT + r')/)?'
+        r'recruiting/([a-z0-9-]+)'
         + _URL_SEGMENT_END +   # the whole tenant segment; the URL may end right after it
-        r'(?:/(?:(?-i:[a-z]{2}[-_][A-Z]{2})/)?([a-zA-Z0-9_%-]*))?',
+        r'(?:/' + _WORKDAY_SITE_SEGMENTS + r')?',
         text, re.IGNORECASE,
     ):
-        path = _decode_unreserved(m.group(3) or "")
-        if re.fullmatch(r'[a-z]{2}[-_][A-Z]{2}', path):
-            path = ""   # locale-only URL: the locale is not the site
+        path = _workday_site(m.group(3))   # "" for a locale-only URL
         info = {"slug": m.group(2), "wd": m.group(1), "path": path or "careers", "site": "myworkdaysite"}
         if path:
             if _is_site_link(text, m.start()):

@@ -23,6 +23,7 @@ from jobs.ats.fetch_report import (
     FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
     attach, count_distinct,
 )
+from jobs.ats.patterns import decode_unreserved
 from jobs.utils import clean_html
 
 logger = logging.getLogger(__name__)
@@ -787,6 +788,10 @@ def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
                         break
                     spent += 1   # only requests actually sent are charged (retry() adds its own)
                     data = _post(url, applied, o, company, rep, text=term, before_retry=retry)
+                    if data is None and not rep.get("blocked"):   # a failed request is not an empty result
+                        rep["failed"] = True
+                        logger.warning("workday search: request failed at offset=%d for %r term=%r applied=%s — partial result",
+                                       o, company, term, applied)
                     jobs = (data or {}).get("jobPostings") or []
                     if not jobs:
                         ended = True
@@ -1153,12 +1158,15 @@ def _normalize(job, company, domain, path, slug_info=None):
             external_url = _parsed_path = ""
         if _is_site:   # drop "/recruiting/{tenant}" first: a site named like the tenant must not match it
             _parsed_path = re.sub(r"^.*?/recruiting/[^/]+", "", _parsed_path)
-        _path_prefix = "/" + path.strip("/")          # e.g. "/NVIDIAExternalCareerSite"
-        # Use find so locale-prefixed URLs (e.g. /en-US/NVIDIAExternalCareerSite/...)
-        # are handled the same as unprefixed ones (/NVIDIAExternalCareerSite/...).
-        _path_idx = _parsed_path.find(_path_prefix + "/")
-        if _path_idx != -1:
-            external_path = _parsed_path[_path_idx + len(_path_prefix):]  # e.g. "/job/Loc/Title_R-1"
+        # Search every position so locale-prefixed URLs (e.g. /en-US/NVIDIAExternalCareerSite/...)
+        # are handled the same as unprefixed ones. The site is compared segment by segment with
+        # unreserved escapes decoded ("%45xternal" is "External"); the rest is kept as written.
+        _segments = _parsed_path.split("/")
+        _site = [decode_unreserved(s) for s in path.strip("/").split("/")]
+        for i in range(1, len(_segments) - len(_site)):   # something must follow the site
+            if [decode_unreserved(s) for s in _segments[i:i + len(_site)]] == _site:
+                external_path = "/" + "/".join(_segments[i + len(_site):])  # e.g. "/job/Loc/Title_R-1"
+                break
 
     # public career site root; myworkdaysite pages live under /recruiting/{tenant}/ (the CXS API does not)
     site_root = domain.rstrip("/")

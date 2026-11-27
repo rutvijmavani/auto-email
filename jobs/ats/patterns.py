@@ -32,6 +32,15 @@ _SITEMAP_MARKER = r"(?:sitemap[^\s]*\.xml|feed\.xml)"   # what makes a URL a sit
 # markup (a Markdown ")" included).
 _WORKDAY_PATH = r"""([^?&#\s"'<>\\)\]}|`]*)"""
 _WORKDAY_LOCALE = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
+# a locale path segment as written in a URL ("en-US", "en%2DUS"), for a regex to step over
+URL_LOCALE_SEGMENT = (
+    r"(?:[a-z]|%6[1-9A-Fa-f]|%7[0-9Aa]){2}(?:[-_]|%2[Dd]|%5[Ff])(?:[A-Z]|%4[1-9A-Fa-f]|%5[0-9Aa]){2}"
+)
+
+# a "/" written as JSON ("\/", "/", also double-escaped) or as an HTML entity. Shared by
+# patterns.py and career_detector.py.
+# The lookbehind starts a match only at the head of a backslash run: no rescanning of a long run.
+ENCODED_SLASH = re.compile(r'(?<!\\)\\+(?:/|u002f)|&#(?:x2f|47);', re.IGNORECASE)
 
 _UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
 
@@ -46,7 +55,7 @@ def decode_unreserved(segment):
     return re.sub(r"%([0-9A-Fa-f]{2})", decoded, segment)
 
 
-def _workday_site(path):
+def workday_site(path):
     """The career site of a Workday link's path: the first segment that is not a locale, without
     trailing sentence punctuation; "" when the path names none."""
     parts = (decode_unreserved(p).rstrip(".,;:!") for p in (path or "").split("/"))
@@ -166,12 +175,12 @@ def _make_patterns():
             "slug": tenant,
             "wd":   wd,
             # bare host or locale-only path: never use the locale as the site
-            "path": _workday_site(m.group(3)) or "careers",
+            "path": workday_site(m.group(3)) or "careers",
         })
 
     def _workday_root_only(m):
         """True when the match names no career site (bare host or locale-only path)."""
-        return not _workday_site(m.group(3))
+        return not workday_site(m.group(3))
 
     _workday_slug.root_only = _workday_root_only
 
@@ -196,13 +205,13 @@ def _make_patterns():
             "slug": tenant,
             "wd":   wd,
             # nothing or only a locale: never use the locale as the site
-            "path": _workday_site(m.group(3)) or "careers",
+            "path": workday_site(m.group(3)) or "careers",
             "site": "myworkdaysite",  # flag different base URL
         })
 
     def _workdaysite_root_only(m):
         """True when the match names no career site (nothing or only a locale after the tenant)."""
-        return not _workday_site(m.group(3))
+        return not workday_site(m.group(3))
 
     _workdaysite_slug.root_only = _workdaysite_root_only
 
@@ -210,7 +219,7 @@ def _make_patterns():
         re.compile(
             # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
             r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com(?::\d+)?/"
-            r"(?:[a-z]{2}[-_][A-Z]{2}/)?"   # optional locale: en-US, fr-FR, pt_BR
+            r"(?:" + URL_LOCALE_SEGMENT + r"/)?"   # optional locale: en-US, fr-FR, pt_BR
             r"recruiting/([a-z0-9-]+)" + URL_SEGMENT_END +   # the whole tenant segment
             r"(?:/" + _WORKDAY_PATH + r")?",   # the site part is optional: the URL may end at the tenant
             re.IGNORECASE
@@ -609,11 +618,16 @@ def match_ats_pattern(url, own_url=False):
         url = url[:at] + host + url[at + len(netloc):]
         start_limit = at + len(host)
 
+    # Workday links in free text may be escaped ("https:\/\/..."): read them with plain slashes,
+    # so the career site after the host is seen. A pasted link is taken as written.
+    workday_text = url if own_url else ENCODED_SLASH.sub("/", url)
+
     root_only = None   # a workday match that names no career site: kept while an explicit site is looked for
     for pattern, platform, extractor in ATS_URL_PATTERNS:
+        text = workday_text if platform == "workday" else url
         # Every match is tried: an earlier one may be rejected (e.g. jobs.myworkdayjobs.com)
         # while a later one in the same text is a real tenant.
-        for m in pattern.finditer(url):
+        for m in pattern.finditer(text):
             if m.start() >= start_limit:
                 break
             try:
@@ -629,7 +643,7 @@ def match_ats_pattern(url, own_url=False):
             if slug and bare:
                 # a root says nothing but its host, so it counts only as a URL's own host or alone,
                 # not as the domain of an email address or as text inside another URL
-                if root_only is None and is_url_authority(url, m.start()):
+                if root_only is None and is_url_authority(text, m.start()):
                     root_only = {"platform": platform, "slug": slug}
                 continue
             if slug:
