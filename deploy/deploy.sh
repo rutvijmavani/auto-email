@@ -107,6 +107,15 @@ _restore_user_cron() {   # $1 = the user's lines, saved before the old setup_cro
     fi
     echo "  [WARN] could not restore your own crontab lines — check 'crontab -l' and add back any of these:"
     printf '%s\n' "$saved"
+    return 1
+}
+
+_restore_saved_user_cron() {   # restores the lines backed up on disk; the backup goes only once they are back
+    [[ -f "$_CRON_USER_BACKUP" ]] || return 0
+    local saved
+    saved=$(cat "$_CRON_USER_BACKUP") || return 1
+    _restore_user_cron "$saved" || return 1
+    rm -f "$_CRON_USER_BACKUP"
 }
 
 # ── Shared rollback helper ────────────────────────────────────────────────────
@@ -132,18 +141,29 @@ _rollback_to_previous() {
         sudo systemctl daemon-reload || true
         # wrappers/crontab regenerated from the new setup_cron.sh must go back with the code
         if ${_CRON_REGENERATED:-false}; then
-            local _user_cron _cron_now
-            if ! _cron_now=$(crontab -l); then
-                # without a copy of the user's lines the old setup_cron.sh must not run; the flag stays
+            local _user_cron _cron_now _setup_ok=true
+            # without a copy of the user's lines on disk the old setup_cron.sh must not run; the flag stays.
+            # A backup left by an earlier rollback is restored first, never overwritten.
+            if ! _restore_saved_user_cron; then
+                echo "  [WARN] an earlier crontab backup is not restored ($_CRON_USER_BACKUP) — cron wrappers not restored (the next deploy retries)"
+            elif ! _cron_now=$(crontab -l); then
                 echo "  [WARN] crontab -l failed — cron wrappers not restored; re-run setup_cron.sh manually (the next deploy retries)"
             else
                 _user_cron=$(_user_cron_lines "$_cron_now")
-                if bash "$PROJECT_DIR/setup_cron.sh"; then
-                    rm -f "$_CRON_PENDING_FLAG"
+                if [[ -n "$_user_cron" ]] \
+                    && ! { printf '%s\n' "$_user_cron" > "$_CRON_USER_BACKUP.tmp" \
+                           && mv "$_CRON_USER_BACKUP.tmp" "$_CRON_USER_BACKUP"; }; then
+                    echo "  [WARN] could not save your crontab lines to $_CRON_USER_BACKUP — cron wrappers not restored (the next deploy retries)"
                 else
-                    echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually (the next deploy retries)"
+                    if ! bash "$PROJECT_DIR/setup_cron.sh"; then
+                        _setup_ok=false
+                        echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually (the next deploy retries)"
+                    fi
+                    # the user's lines go back even when setup_cron.sh failed part-way
+                    if _restore_saved_user_cron && $_setup_ok; then
+                        rm -f "$_CRON_PENDING_FLAG"
+                    fi
                 fi
-                _restore_user_cron "$_user_cron"
             fi
         fi
     else
@@ -200,7 +220,11 @@ _pull_err() {
 }
 
 _CRON_PENDING_FLAG="$PROJECT_DIR/data/.cron_regen_pending"
+_CRON_USER_BACKUP="$PROJECT_DIR/data/.cron_user_lines"   # present = a rollback did not put these back
 _CRON_REGENERATED=false
+if ! _restore_saved_user_cron; then
+    echo "  [WARN] crontab backup kept in $_CRON_USER_BACKUP — the next deploy retries"
+fi
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 

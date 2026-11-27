@@ -558,7 +558,8 @@ def _plan_board(url, company, rep, base=None):
                     company, applied, size, keep)
                 continue
             name, values, covered = best
-            nodes.append({"applied": dict(applied), "K": size, "facet": name, "depth": depth,
+            # K is the coverage floor _recover checks: the facet estimate, or the node's own higher total
+            nodes.append({"applied": dict(applied), "K": max(size, total), "facet": name, "depth": depth,
                           "sum": covered, "used": used})
             logger.info("workday plan: %r depth=%d size=%d split by %s (%d values, sum=%d)",
                         company, depth, size, name, len(values), covered)
@@ -584,10 +585,13 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     A leaf marked "grows" (the flat board, or a slice of a split board) takes a higher total reported by
     any of its pages: the new count becomes its promise, and the extra offsets are paged on the request
     budget already set. The flat board's new count is also rep["reported"]; a slice's rise is recorded in
-    rep["grown_leaves"] (applied, rise), which _recover adds to the nodes holding the slice. Past
-    WORKDAY_RESULT_CAP that needs a tenant probed as uncapped: growth that reaches the cap on an unprobed
+    rep["grown_leaves"] (applied, rise), which _recover adds to the nodes holding the slice. Paging past
+    WORKDAY_RESULT_CAP needs a tenant probed as uncapped: growth that reaches the cap on an unprobed
     tenant probes it (once, one budgeted request). If the probe says capped, fails, or cannot be sent,
-    paging stops at the cap and sets rep["capped"]. A total of 0 (later pages often report none) or a lower
+    paging stops at the cap. On the flat board that sets rep["capped"]. A slice records its whole rise,
+    rows past the cap included, and _recover decides whether a node holding it is short; only a slice
+    whose highest total is exactly the cap sets rep["capped"], as its real count is unknown (a capped
+    tenant reports the cap for anything larger). A total of 0 (later pages often report none) or a lower
     one is ignored.
     """
     got = {}
@@ -613,7 +617,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         return False
 
     offs = list(leaf["offs"])
-    size = leaf["K"]   # the promised count
+    size = leaf["K"]   # the promised count: how far the leaf is paged
+    highest = size     # the highest count promised or reported (past `size` when the cap clips the paging)
     first = leaf["first"]
     asked = 0   # offsets of `offs` already requested
     probed = False   # the cap probe is sent at most once per leaf
@@ -621,7 +626,7 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
 
     def follow(data, off):
         """Raise the promise to the higher total of the response at `off`, adding the offsets it now needs."""
-        nonlocal size, probed, page1
+        nonlocal size, highest, probed, page1
         if off == 0 and not page1:
             page1 = (data or {}).get("jobPostings")   # kept now: a later page may be the one reporting growth
         total = (data or {}).get("total") or 0
@@ -637,11 +642,13 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
                 _budget_add(rep, 1)
                 rep["logical"] = rep.get("logical", 0) + 1   # the probe is one request
                 _board_is_capped(url, leaf["applied"], page1, rep, company)   # caches rep["capped_board"]
+        if leaf.get("split") and total > highest:   # a rise already recorded is not added again
+            rep.setdefault("grown_leaves", []).append((leaf["applied"], total - highest))
+            highest = total
         if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is not False:
-            rep["capped"] = True   # offsets past the cap may repeat page 1: page up to it only
-            total = max(size, WORKDAY_RESULT_CAP)
-        if leaf.get("split") and total > size:   # a leaf already clipped to the cap rises no further
-            rep.setdefault("grown_leaves", []).append((leaf["applied"], total - size))
+            if not leaf.get("split"):
+                rep["capped"] = True   # no node above the flat board can check coverage
+            total = max(size, WORKDAY_RESULT_CAP)   # offsets past the cap may repeat page 1: page up to it only
         size = total
         offs.extend(range(offs[-1] + WORKDAY_PAGE_SIZE, size, WORKDAY_PAGE_SIZE))
 
@@ -699,6 +706,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         rep.setdefault("early_leaves", []).append((leaf["applied"], len(got) + unrequested, len(got)))
     if not stopped and len(got) != size:
         rep.setdefault("leaf_mismatch", []).append((leaf["applied"], size, len(got)))
+    if leaf.get("split") and highest == WORKDAY_RESULT_CAP > leaf["K"] and rep.get("capped_board") is not False:
+        rep["capped"] = True   # grew to exactly the cap: how many lie past it is unknown, so no node can check
     return got
 
 
@@ -1105,7 +1114,7 @@ def _job_req_id(job, external_path, job_url):
     to it minus a trailing "-<digits>" (Intel JR0289044-1 -> JR0289044); else the token itself when it is
     shaped like an id (Wisconsin); else (a word such as "..._Engineer") the first id-shaped bullet.
     Without a usable path token: bulletFields[0] if it is shaped like an id (no spaces, has a digit);
-    else the URL's own posting id (a numeric last segment or "_R-...").
+    else the posting id in the URL's last path segment (all digits, or "_R-...").
     With no requisition id at all, the posting's own path (externalPath, else its posting URL's key), so
     postings sharing a word or a text bullet stay apart. Not "": the scan workers drop a job without a
     job_id. "" only when the posting has no path of its own either.
@@ -1131,7 +1140,7 @@ def _job_req_id(job, external_path, job_url):
         last = ""
     if last.isdigit():
         return last
-    m = re.search(r"_((?:JR|R)-?\d+(?:-\d+)?)", job_url)
+    m = re.search(r"_((?:JR|R)-?\d+(?:-\d+)?)", last)
     return m.group(1) if m else external_path or _own_url_key(job_url)
 
 

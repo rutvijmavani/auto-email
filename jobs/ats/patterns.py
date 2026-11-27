@@ -628,7 +628,8 @@ def match_ats_pattern(url, own_url=False):
     hosts (jobs.ea.com, ...) instead needs the link's hostname to equal one of them. User
     information ("user@") is dropped first: it is not the host. A "/url?q=" redirect is followed
     only from a Google origin; a pasted one from any other origin matches nothing. A sitemap is
-    recognised from the link's own path, and keeps its query.
+    recognised from the link's own path, and keeps its query. A sitemap on a Workday host is a
+    sitemap: the first part of its path is not a career site.
     """
     if not url:
         return None
@@ -642,6 +643,7 @@ def match_ats_pattern(url, own_url=False):
     url = _decode_google_redirect(url)
 
     start_limit = len(url)   # matches must start before this index
+    own_feed = False   # the pasted link's own path names a sitemap / XML feed
     if own_url:
         from urllib.parse import urlsplit
         try:
@@ -656,6 +658,7 @@ def match_ats_pattern(url, own_url=False):
         host = netloc.rsplit("@", 1)[-1]
         url = url[:at] + host + url[at + len(netloc):]
         start_limit = at + len(host)
+        own_feed = bool(re.search(_SITEMAP_MARKER, split.path, re.IGNORECASE))
 
     # Workday links in free text may be escaped ("https:\/\/..."): read them with plain slashes,
     # so the career site after the host is seen. A pasted link is taken as written.
@@ -667,6 +670,8 @@ def match_ats_pattern(url, own_url=False):
         hosts = getattr(extractor, "hosts", None)
         if own_url and hosts and own_host not in hosts:
             continue   # "xjobs.ea.com" and "jobs.ea.com.example.org" only contain the host's name
+        if own_feed and platform == "workday":
+            continue   # "/External/siteMap.xml" would otherwise read as the board "External"
         # Every match is tried: an earlier one may be rejected (e.g. jobs.myworkdayjobs.com)
         # while a later one in the same text is a real tenant.
         for m in pattern.finditer(text):
@@ -680,7 +685,7 @@ def match_ats_pattern(url, own_url=False):
                 continue
             if own_url and platform == "sitemap":
                 # its match always begins at the scheme, so the start limit proves nothing
-                if not re.search(_SITEMAP_MARKER, urlsplit(url).path, re.IGNORECASE):
+                if not own_feed:
                     continue
                 slug = json.dumps({"url": url.split("#", 1)[0]})   # the query may select the feed
             if slug and bare:
