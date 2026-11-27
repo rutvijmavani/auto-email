@@ -3,6 +3,7 @@
 # Risk: undocumented — monitor for structural changes
 
 import collections
+import hashlib
 import json
 import logging
 import math
@@ -260,27 +261,32 @@ def _is_req_id(text):
     return isinstance(text, str) and bool(re.fullmatch(r"\S*\d\S*", text))
 
 
+def _own_url_key(url):
+    """
+    The part of a posting's URL that names that posting alone, "" for a generic URL postings share.
+    A "/job/" URL gives its board-relative path, the form externalPath has (host, locale and site prefix
+    dropped); a legacy URL ending in a posting id (".../1", "..._R-12") gives the whole URL.
+    """
+    bare = url.split("#", 1)[0].split("?", 1)[0]    # tracking query/fragment must not make one posting two keys
+    try:
+        upath = urlparse(bare).path
+    except ValueError:   # malformed URL (e.g. "http://[..."): not posting-specific
+        return ""
+    last = upath.rstrip("/").rsplit("/", 1)[-1]
+    if "/job/" in upath:
+        return upath[upath.find("/job/"):]
+    if last.isdigit() or re.search(r"_(?:JR|R)-?\d+(?:-\d+)?$", last):
+        return bare
+    return ""
+
+
 def _job_key(posting):
     """Identity of a listing across facet slices: its relative path or posting URL, else req id, else its
     title+location (with any other URL and bullets, so a URL or label shared by postings merges none)."""
     if posting.get("externalPath"):
         return posting["externalPath"]
     url = posting.get("externalUrl") or ""
-    bare = url.split("#", 1)[0].split("?", 1)[0]    # tracking query/fragment must not make one posting two keys
-    # only a posting-specific URL counts, a generic one is shared. A "/job/" URL keys by its
-    # board-relative path, the form externalPath has (host, locale and site prefix dropped); a legacy URL
-    # ending in a posting id (".../1", "..._R-12") keys by the whole URL
-    try:
-        upath = urlparse(bare).path
-    except ValueError:   # malformed URL (e.g. "http://[..."): not posting-specific, fall through
-        upath = ""
-    last = upath.rstrip("/").rsplit("/", 1)[-1]
-    if "/job/" in upath:
-        own = upath[upath.find("/job/"):]
-    elif last.isdigit() or re.search(r"_(?:JR|R)-?\d+(?:-\d+)?$", last):
-        own = bare
-    else:
-        own = ""
+    own = _own_url_key(url)
     if own:
         return own
     bullets = posting.get("bulletFields") or []
@@ -602,7 +608,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         total = (data or {}).get("total") or 0
         if not leaf.get("grows") or total <= size:
             return
-        rep["reported"] = total
+        # the highest total seen: a capped board may answer a later page with a lower one
+        rep["reported"] = max(rep.get("reported") or 0, total)
         if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is None and not probed:
             # reaching the cap does not make a board capped: ask it, comparing against page 1's rows
             page1 = first or (off == 0 and data.get("jobPostings"))
@@ -1187,7 +1194,16 @@ def _normalize(job, company, domain, path, slug_info=None):
         # so we never silently drop a job with a valid title
         job_url = site_root
 
-    _bullet_id = _job_req_id(job, external_path, job_url)
+    if not (job.get("externalPath") or "").strip() and not _own_url_key(job_url):
+        # A careers URL (or the root) that postings share. job_postings.job_url is unique and distinct
+        # counts fall back to it, so the posting's identity goes into the fragment: the link still opens
+        # the same page. Only a requisition-shaped bullet is its job_id; a text label is shared too.
+        bullets = job.get("bulletFields") or []
+        _bullet_id = bullets[0] if bullets and _is_req_id(bullets[0]) else ""
+        digest = hashlib.sha1(_job_key(job).encode("utf-8", "replace")).hexdigest()[:16]
+        job_url += ("&" if "#" in job_url else "#") + "wd-" + digest
+    else:
+        _bullet_id = _job_req_id(job, external_path, job_url)
 
     return {
         "company":        company,

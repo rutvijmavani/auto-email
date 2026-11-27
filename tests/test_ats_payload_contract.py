@@ -181,9 +181,32 @@ class TestBuildDetailPayloadKeyForwarding(unittest.TestCase):
             def lrange(self, key, a, b):
                 return [json.dumps(bad), json.dumps(good)]
         self.assertEqual(purge._purge_list(FakeRedis(), "q", dry_run=True), (2, 1))
-        # the Lua filter (run by Redis on apply) must treat a JSON null the same way
-        self.assertIn("parsed['_slug'] == cjson.null", purge._FILTER_LUA)
-        self.assertIn("parsed['_path'] == cjson.null", purge._FILTER_LUA)
+
+    @unittest.skipUnless(os.getenv("TEST_REDIS_URL"), "TEST_REDIS_URL not set (needs a throwaway Redis)")
+    def test_purge_apply_matches_dry_run(self):
+        """The Lua filter (apply) removes exactly what the Python check (dry run) counts."""
+        import json
+        import uuid
+        import redis
+        from scripts import purge_stale_detail_payloads as purge
+        good = {"ats_platform": "workday", "_slug": "nxp", "_wd": "", "_path": "careers"}
+        bad = [dict(good, **{key: value})
+               for key in ("_slug", "_path")
+               for value in (None, "", 0, 0.0, False, [], {})]
+        bad.append({k: v for k, v in good.items() if k != "_wd"})
+        bad.append(dict(good, _site="myworkdaysite"))
+        keep = [json.dumps(good), json.dumps(dict(good, _slug=1)),
+                json.dumps({"ats_platform": "lever", "_slug": 0}), json.dumps("workday"), "not json"]
+        r = redis.Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=True)
+        key = f"test:purge:{uuid.uuid4().hex}"
+        try:
+            r.rpush(key, *[json.dumps(job) for job in bad], *keep)
+            expected = (len(bad) + len(keep), len(bad))
+            self.assertEqual(purge._purge_list(r, key, dry_run=True), expected)
+            self.assertEqual(purge._purge_list(r, key, dry_run=False), expected)
+            self.assertEqual(r.lrange(key, 0, -1), keep)
+        finally:
+            r.delete(key)
 
     def test_taleo_keys_forwarded(self):
         """Taleo required keys: _base_url, _contest_no, _section."""

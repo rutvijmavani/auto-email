@@ -282,8 +282,9 @@ from jobs.ats.patterns import is_url_authority as _is_url_authority
 from jobs.ats.patterns import workday_site as _workday_site
 
 
-# the first two path segments of a Workday link: the career site, perhaps after a locale
-_WORKDAY_SITE_SEGMENTS = r'((?:[a-zA-Z0-9_%-]+/)?[a-zA-Z0-9_%-]*)'
+# the path of a Workday link: the career site, perhaps after locales or the API prefix
+# (workday_site picks the site out of it)
+_WORKDAY_SITE_SEGMENTS = r'((?:[a-zA-Z0-9_%-]+/)*[a-zA-Z0-9_%-]*)'
 
 
 def _extract_workday(text):

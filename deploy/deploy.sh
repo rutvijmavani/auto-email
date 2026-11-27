@@ -68,6 +68,37 @@ fi
 # Capture the current SHA before any update so we can roll back if needed.
 PREVIOUS_SHA=$(git rev-parse HEAD)
 
+# ── The user's own crontab lines ──────────────────────────────────────────────
+# Rollback runs PREVIOUS_SHA's setup_cron.sh, and an older one strips every run_*.sh entry, the
+# user's own included. These two helpers carry the lines the pipeline does not own across that run.
+# Their filters are those of setup_cron.sh's merge: keep them in step.
+_user_cron_lines() {   # $1 = crontab text
+    local lines="$1"
+    if grep -qF '# === BEGIN RECRUITER PIPELINE ===' <<<"$lines"; then
+        # unmatched BEGIN: setup_cron.sh aborts without writing, so there is nothing to carry over
+        grep -qF '# === END RECRUITER PIPELINE ===' <<<"$lines" || return 0
+        lines=$(sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d' <<<"$lines")
+    fi
+    { grep -Ev '/home/opc/mail/run_(sync|nightly|monday|monthly|outreach|monitor|detect|weekly_summary|enrich|renew_watch|verify_filled|sync_dol_lca)\.sh([[:space:]]|$|[;&|<>)"'"'"'])' <<<"$lines" \
+        | grep -v 'scripts/log_monitor\.py' \
+        | grep -v 'hashlib.*range(100000)' \
+        | sed '/^[[:space:]]*$/d'; } || true   # grep exits 1 when no line is left
+}
+
+_restore_user_cron() {   # $1 = the user's lines, saved before the old setup_cron.sh ran
+    local saved="$1" block
+    [[ -n "$saved" ]] || return 0
+    # the pipeline block as it is now installed, with the saved lines before it
+    block=$(crontab -l 2>/dev/null \
+        | sed -n '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/p') || block=""
+    if grep -qF '# === END RECRUITER PIPELINE ===' <<<"$block" \
+        && printf '%s\n%s\n' "$saved" "$block" | crontab -; then
+        return 0
+    fi
+    echo "  [WARN] could not restore your own crontab lines — check 'crontab -l' and add back any of these:"
+    printf '%s\n' "$saved"
+}
+
 # ── Shared rollback helper ────────────────────────────────────────────────────
 _rollback_to_previous() {
     echo "  [ROLLBACK] Reverting to $PREVIOUS_SHA..."
@@ -91,11 +122,14 @@ _rollback_to_previous() {
         sudo systemctl daemon-reload || true
         # wrappers/crontab regenerated from the new setup_cron.sh must go back with the code
         if ${_CRON_REGENERATED:-false}; then
+            local _user_cron
+            _user_cron=$(_user_cron_lines "$(crontab -l 2>/dev/null || true)")
             if bash "$PROJECT_DIR/setup_cron.sh"; then
                 rm -f "$_CRON_PENDING_FLAG"
             else
                 echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually (the next deploy retries)"
             fi
+            _restore_user_cron "$_user_cron"
         fi
     else
         echo "  [WARN] Skipping pip install and unit sync — code state unknown"

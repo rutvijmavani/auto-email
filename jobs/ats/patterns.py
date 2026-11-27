@@ -55,11 +55,22 @@ def decode_unreserved(segment):
     return re.sub(r"%([0-9A-Fa-f]{2})", decoded, segment)
 
 
+def workday_site_segments(segments):
+    """The segments of a Workday link's path from the career site on: locales are dropped, and an API
+    link (/wday/cxs/{tenant}/{site}/...) starts after the tenant. Empty when the path names no site.
+    Shared by patterns.py, career_detector.py (through workday_site) and build_ats_slug_list.py."""
+    parts = [p for p in segments if p and not _WORKDAY_LOCALE.match(p)]
+    if parts[:1] == ["wday"]:   # "wday" is Workday's API prefix, never a career site
+        parts = parts[3:] if parts[1:2] == ["cxs"] else []
+    return parts
+
+
 def workday_site(path):
-    """The career site of a Workday link's path: the first segment that is not a locale, without
-    trailing sentence punctuation; "" when the path names none."""
-    parts = (decode_unreserved(p).rstrip(".,;:!") for p in (path or "").split("/"))
-    return next((p for p in parts if p and not _WORKDAY_LOCALE.match(p)), "")
+    """The career site of a Workday link's path (see workday_site_segments), without trailing sentence
+    punctuation; "" when the path names none."""
+    parts = workday_site_segments(
+        decode_unreserved(p).rstrip(".,;:!") for p in (path or "").split("/"))
+    return parts[0] if parts else ""
 
 
 # where one URL or word ends in HTML/JS/JSON text (literal escapes and quote/angle entities included)
