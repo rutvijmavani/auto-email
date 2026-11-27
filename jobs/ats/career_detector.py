@@ -277,14 +277,10 @@ from jobs.ats.patterns import ENCODED_SLASH as _ENCODED_SLASH
 from jobs.ats.patterns import URL_LOCALE_SEGMENT as _URL_LOCALE_SEGMENT
 from jobs.ats.patterns import URL_SEGMENT_END as _URL_SEGMENT_END
 from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
+from jobs.ats.patterns import WORKDAY_PATH as _WORKDAY_PATH
 from jobs.ats.patterns import is_site_link as _is_site_link
 from jobs.ats.patterns import is_url_authority as _is_url_authority
 from jobs.ats.patterns import workday_site as _workday_site
-
-
-# the path of a Workday link: the career site, perhaps after locales or the API prefix
-# (workday_site picks the site out of it)
-_WORKDAY_SITE_SEGMENTS = r'((?:[a-zA-Z0-9_%-]+/)*[a-zA-Z0-9_%-]*)'
 
 
 def _extract_workday(text):
@@ -294,7 +290,7 @@ def _extract_workday(text):
     for m in re.finditer(
         r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])'
         r'(?:\.(?=[:/]))?(?::\d+)?'   # a host may be written with its terminal dot
-        r'(?:/' + _WORKDAY_SITE_SEGMENTS + r')?',
+        r'(?:/' + _WORKDAY_PATH + r')?',
         text, re.IGNORECASE,
     ):
         if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:
@@ -317,7 +313,7 @@ def _extract_workday(text):
         r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com\.?(?::\d+)?/(?:(?-i:' + _URL_LOCALE_SEGMENT + r')/)?'
         r'recruiting/([a-z0-9-]+)'
         + _URL_SEGMENT_END +   # the whole tenant segment; the URL may end right after it
-        r'(?:/' + _WORKDAY_SITE_SEGMENTS + r')?',
+        r'(?:/' + _WORKDAY_PATH + r')?',
         text, re.IGNORECASE,
     ):
         path = _workday_site(m.group(3))   # "" for a locale-only URL

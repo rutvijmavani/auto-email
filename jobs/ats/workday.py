@@ -147,8 +147,8 @@ def _country_filter(url, company, rep):
     """
     appliedFacets for the one tenant that is read for a single country (Accenture: US only; non-US jobs are
     deleted after the detail fetch anyway). The value id is looked up on page 1 of the unfiltered query each
-    scan, so a re-keyed id cannot break it. Returns {facet: [id]}, or None when page 1 failed or the value
-    is missing (rep["failed"] / rep["filter_missing"] say which).
+    scan, so a re-keyed id cannot break it. Returns {facet: [id]}, or None when page 1 failed, the board is
+    empty or the value is missing (rep["failed"] / rep["empty_board"] / rep["filter_missing"] say which).
     """
     data = _page1(url, {}, company, rep)
     if data is None:
@@ -162,6 +162,11 @@ def _country_filter(url, company, rep):
         for v in f.get("values") or []:
             if isinstance(v, dict) and v.get("id") and str(v.get("descriptor", "")).strip().lower() == wanted:
                 return {WORKDAY_COUNTRY_FILTER_FACET: [v["id"]]}
+    # a reported total of 0 with no postings has nothing to filter; a response without a total says nothing
+    if type(data.get("total")) is int and data["total"] == 0 and not data.get("jobPostings"):
+        rep["empty_board"] = True
+        logger.info("workday country filter: %r reports an empty board", company)
+        return None
     rep["filter_missing"] = True
     logger.error("workday country filter: %r has no %r value in facet %s — not fetching the unfiltered board",
                  company, WORKDAY_COUNTRY_FILTER_DESCRIPTOR, WORKDAY_COUNTRY_FILTER_FACET)
@@ -169,12 +174,17 @@ def _country_filter(url, company, rep):
 
 
 def _filter_missing_result(rep):
-    """Not-complete report for a scan that could not resolve its country filter (nothing fetched)."""
-    stop = STOP_NO_CONFIG if rep.get("filter_missing") else STOP_REQUEST_FAILED
+    """Report for a scan with no country filter to apply (nothing fetched): complete for an empty board,
+    not complete when the filter could not be resolved."""
+    empty = rep.get("empty_board")
+    if empty:
+        stop = STOP_ALL_PAGES
+    else:
+        stop = STOP_NO_CONFIG if rep.get("filter_missing") else STOP_REQUEST_FAILED
     return attach([], FetchReport(
         stop_reason=stop, pages=rep["pages"], fetched_distinct=0, unusable=0,
-        reported_total=None, total_source=TOTAL_ATS,
-        note=f"country filter {WORKDAY_COUNTRY_FILTER_DESCRIPTOR!r} not resolved",
+        reported_total=0 if empty else None, total_source=TOTAL_ATS,
+        note="" if empty else f"country filter {WORKDAY_COUNTRY_FILTER_DESCRIPTOR!r} not resolved",
     ))
 
 
@@ -208,7 +218,7 @@ def fetch_jobs(slug_info, company, stop_check=None):
     base = {}
     if str(slug_info.get("slug") or "").lower() == str(WORKDAY_COUNTRY_FILTER_TENANT).lower():
         base = _country_filter(url, company, rep)
-        if base is None:   # filter value missing: never fall back to the unfiltered board
+        if base is None:   # no filter to apply: never fall back to the unfiltered board
             return _filter_missing_result(rep)
     leaves, nodes = _plan_board(url, company, rep, base)
     merged, leaf_got = _fetch_leaves(url, leaves, company, rep, gate=stop_check, norm=norm)
@@ -462,14 +472,19 @@ def _distinct(rows):
     return len({_job_key(p) for p in rows})
 
 
-def _make_leaf(rep, applied, size, first=None):
-    """A query below the cap that is paged to its end. `first` = page 1 when already fetched."""
+def _make_leaf(rep, applied, size, first=None, split=None):
+    """A query below the cap that is paged to its end. `first` = page 1 when already fetched.
+    `split` marks a planned leaf, which follows a total that rises (see _fetch_leaf): False for the flat
+    board, True for a slice of a split board. Left None, the leaf keeps its size."""
     first = list(first or [])
     # a cached page 1 that came back short is fetched again from offset 0; a full one costs no request
     start = len(first) if _distinct(first) >= min(WORKDAY_PAGE_SIZE, size) else 0
     offs = list(range(start, size, WORKDAY_PAGE_SIZE))
     _budget_add(rep, len(offs))
-    return {"applied": applied, "K": size, "first": first, "offs": offs}
+    leaf = {"applied": applied, "K": size, "first": first, "offs": offs}
+    if split is not None:
+        leaf.update(grows=True, split=split)
+    return leaf
 
 
 def _plan_board(url, company, rep, base=None):
@@ -523,9 +538,7 @@ def _plan_board(url, company, rep, base=None):
                     rep["logical"] = rep.get("logical", 0) + 1   # the probe is one request
                 capped = _board_is_capped(url, applied, first, rep, company)
             if not capped:
-                leaf = _make_leaf(rep, applied, total, first)
-                leaf["grows"] = depth == 0   # a flat board has no recovery: its leaf follows a total that rises
-                leaves.append(leaf)
+                leaves.append(_make_leaf(rep, applied, total, first, split=depth > 0))
                 continue
             cands = _facet_candidates(data.get("facets"), used)
             if size is None:
@@ -552,7 +565,7 @@ def _plan_board(url, company, rep, base=None):
             for v in values:
                 child = {**applied, name: [v["id"]]}
                 if v["count"] < WORKDAY_RESULT_CAP:
-                    leaves.append(_make_leaf(rep, child, v["count"]))
+                    leaves.append(_make_leaf(rep, child, v["count"], split=True))
                 else:
                     work.append((child, v["count"], used + (name,), depth + 1))
     except _OverBudget as e:
@@ -566,14 +579,16 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     Page one leaf sequentially. Returns {job_key: posting}. The early-exit gate (fresh per leaf) sees
     every non-final page that adds a job to this leaf (a replayed page cannot confirm the exit); True ends
     the leaf and sets rep["early"]. Pages that failed or came back short are requested once more; a leaf that still does not match its promised count is recorded in
-    rep["leaf_mismatch"] (leaf totals are exact).
+    rep["leaf_mismatch"].
 
-    A leaf marked "grows" (the flat board) takes a higher total reported by any of its pages: the new
-    count becomes its promise and rep["reported"], and the extra offsets are paged on the request budget
-    already set. Past WORKDAY_RESULT_CAP that needs a tenant probed as uncapped: growth that reaches the cap
-    on an unprobed tenant probes it (once, one budgeted request). If the probe says capped, fails, or cannot
-    be sent, paging stops at the cap and sets rep["capped"]. A total of 0 (later pages often report none) or
-    a lower one is ignored.
+    A leaf marked "grows" (the flat board, or a slice of a split board) takes a higher total reported by
+    any of its pages: the new count becomes its promise, and the extra offsets are paged on the request
+    budget already set. The flat board's new count is also rep["reported"]; a slice's rise is recorded in
+    rep["grown_leaves"] (applied, rise), which _recover adds to the nodes holding the slice. Past
+    WORKDAY_RESULT_CAP that needs a tenant probed as uncapped: growth that reaches the cap on an unprobed
+    tenant probes it (once, one budgeted request). If the probe says capped, fails, or cannot be sent,
+    paging stops at the cap and sets rep["capped"]. A total of 0 (later pages often report none) or a lower
+    one is ignored.
     """
     got = {}
     leaf_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
@@ -612,8 +627,9 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         total = (data or {}).get("total") or 0
         if not leaf.get("grows") or total <= size:
             return
-        # the highest total seen: a capped board may answer a later page with a lower one
-        rep["reported"] = max(rep.get("reported") or 0, total)
+        if not leaf.get("split"):   # a slice's total is not the board's
+            # the highest total seen: a capped board may answer a later page with a lower one
+            rep["reported"] = max(rep.get("reported") or 0, total)
         if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is None and not probed:
             # reaching the cap does not make a board capped: ask it, comparing against page 1's rows
             if page1 and not rep.get("blocked") and rep.get("logical", 0) < rep.get("budget", 0.0):
@@ -624,6 +640,8 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is not False:
             rep["capped"] = True   # offsets past the cap may repeat page 1: page up to it only
             total = max(size, WORKDAY_RESULT_CAP)
+        if leaf.get("split") and total > size:   # a leaf already clipped to the cap rises no further
+            rep.setdefault("grown_leaves", []).append((leaf["applied"], total - size))
         size = total
         offs.extend(range(offs[-1] + WORKDAY_PAGE_SIZE, size, WORKDAY_PAGE_SIZE))
 
@@ -841,13 +859,18 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
     only for nodes up to WORKDAY_WINDOW_MAX x the cap); else searchText. A node still short is recorded
     in rep["partial"] and sets rep["capped"]; that is judged after the last node, because a parent's rows
     can give a title to a child's titleless one. What an early-exited leaf inside the node skipped on purpose
-    (rep["early_leaves"]: applied, K, got) is not counted as a gap; short sibling leaves still are.
+    (rep["early_leaves"]: applied, K, got) is not counted as a gap; short sibling leaves still are. A leaf
+    that rose above its promise (rep["grown_leaves"]) raises the node's count by as much, so its extra rows
+    cannot stand in for rows a sibling lost.
     """
     early = rep.get("early_leaves") or []
+    grown = rep.get("grown_leaves") or []
     short = []   # (applied, size, tolerance, skip credit) of nodes short when their turn ended
     try:
         for node in sorted(nodes, key=lambda n: -n["depth"]):
-            applied, size = node["applied"], node["K"]
+            applied = node["applied"]
+            size = node["K"] + sum(rise for e, rise in grown
+                                   if all(e.get(a) == b for a, b in applied.items()))
             # jobs an early-exited leaf inside this node skipped on purpose: not a gap
             skipped = sum(max(0, k - got) for e, k, got in early
                           if all(e.get(a) == b for a, b in applied.items()))
@@ -875,7 +898,7 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
             skipped0 = skipped
             skipped = max(0, skipped0 - (have - have0))
             if size - have - skipped > tol:
-                _search_node(url, node, merged, leaf_got, tol, company, rep, skipped)
+                _search_node(url, dict(node, K=size), merged, leaf_got, tol, company, rep, skipped)
                 have = len(_node_union(applied, leaf_got, merged))
                 skipped = max(0, skipped0 - (have - have0))
             if size - have - skipped > tol:
@@ -1201,11 +1224,12 @@ def _normalize(job, company, domain, path, slug_info=None):
     if not (job.get("externalPath") or "").strip() and not _own_url_key(job_url):
         # A careers URL (or the root) that postings share. job_postings.job_url is unique and distinct
         # counts fall back to it, so the posting's identity goes into the fragment: the link still opens
-        # the same page. Only a requisition-shaped bullet is its job_id; a text label is shared too.
+        # the same page. The workers drop a job without a job_id: it is a requisition-shaped bullet, else
+        # that same identity (a text label is shared too).
+        tag = "wd-" + hashlib.sha1(_job_key(job).encode("utf-8", "replace")).hexdigest()[:16]
         bullets = job.get("bulletFields") or []
-        _bullet_id = bullets[0] if bullets and _is_req_id(bullets[0]) else ""
-        digest = hashlib.sha1(_job_key(job).encode("utf-8", "replace")).hexdigest()[:16]
-        job_url += ("&" if "#" in job_url else "#") + "wd-" + digest
+        _bullet_id = bullets[0] if bullets and _is_req_id(bullets[0]) else tag
+        job_url += ("&" if "#" in job_url else "#") + tag
     else:
         _bullet_id = _job_req_id(job, external_path, job_url)
 

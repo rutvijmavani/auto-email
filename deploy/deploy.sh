@@ -86,14 +86,24 @@ _user_cron_lines() {   # $1 = crontab text
 }
 
 _restore_user_cron() {   # $1 = the user's lines, saved before the old setup_cron.sh ran
-    local saved="$1" block
+    local saved="$1" current outside line merged missing=false
     [[ -n "$saved" ]] || return 0
-    # the pipeline block as it is now installed, with the saved lines before it
-    block=$(crontab -l 2>/dev/null \
-        | sed -n '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/p') || block=""
-    if grep -qF '# === END RECRUITER PIPELINE ===' <<<"$block" \
-        && printf '%s\n%s\n' "$saved" "$block" | crontab -; then
-        return 0
+    if current=$(crontab -l 2>/dev/null); then
+        # a line counts as present only outside the pipeline block
+        outside=$(sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d' <<<"$current")
+        while IFS= read -r line; do
+            grep -qxF -- "$line" <<<"$outside" || missing=true
+        done <<<"$saved"
+        $missing || return 0
+        # the saved lines first, in their own order, then every other line installed now (the pipeline
+        # block included): nothing that is in the crontab is dropped
+        merged=$(SAVED="$saved" awk '
+            BEGIN { n = split(ENVIRON["SAVED"], s, "\n"); for (i = 1; i <= n; i++) { print s[i]; have[s[i]]++ } }
+            /# === BEGIN RECRUITER PIPELINE ===/ { block = 1 }
+            !block && have[$0] > 0 { have[$0]--; next }
+            { print }
+            /# === END RECRUITER PIPELINE ===/ { block = 0 }
+        ' <<<"$current") && printf '%s\n' "$merged" | crontab - && return 0
     fi
     echo "  [WARN] could not restore your own crontab lines — check 'crontab -l' and add back any of these:"
     printf '%s\n' "$saved"
@@ -122,14 +132,19 @@ _rollback_to_previous() {
         sudo systemctl daemon-reload || true
         # wrappers/crontab regenerated from the new setup_cron.sh must go back with the code
         if ${_CRON_REGENERATED:-false}; then
-            local _user_cron
-            _user_cron=$(_user_cron_lines "$(crontab -l 2>/dev/null || true)")
-            if bash "$PROJECT_DIR/setup_cron.sh"; then
-                rm -f "$_CRON_PENDING_FLAG"
+            local _user_cron _cron_now
+            if ! _cron_now=$(crontab -l); then
+                # without a copy of the user's lines the old setup_cron.sh must not run; the flag stays
+                echo "  [WARN] crontab -l failed — cron wrappers not restored; re-run setup_cron.sh manually (the next deploy retries)"
             else
-                echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually (the next deploy retries)"
+                _user_cron=$(_user_cron_lines "$_cron_now")
+                if bash "$PROJECT_DIR/setup_cron.sh"; then
+                    rm -f "$_CRON_PENDING_FLAG"
+                else
+                    echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually (the next deploy retries)"
+                fi
+                _restore_user_cron "$_user_cron"
             fi
-            _restore_user_cron "$_user_cron"
         fi
     else
         echo "  [WARN] Skipping pip install and unit sync — code state unknown"

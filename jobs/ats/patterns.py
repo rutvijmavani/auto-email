@@ -28,9 +28,11 @@ URL_SEGMENT_END = r"""(?=$|[/?#&\s"'<>\\)\]}|`]|[.,;:!](?![a-z0-9]))"""
 
 _SITEMAP_MARKER = r"(?:sitemap[^\s]*\.xml|feed\.xml)"   # what makes a URL a sitemap / XML feed
 
-# The path of a Workday link: it ends at the query, the fragment, or what closes a link in text or
-# markup (a Markdown ")" included).
-_WORKDAY_PATH = r"""([^?&#\s"'<>\\)\]}|`]*)"""
+# The path of a Workday link, from its first segment on: segments (empty ones included, "en-US//Site")
+# of the characters a site name is written with. It ends at the first other character: the query, what
+# closes a link in text or markup, a template placeholder ("${site}"). Shared by patterns.py and
+# career_detector.py; workday_site picks the site out of it.
+WORKDAY_PATH = r"((?:[a-zA-Z0-9_%-]*/)*[a-zA-Z0-9_%-]*)"
 _WORKDAY_LOCALE = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
 # a locale path segment as written in a URL ("en-US", "en%2DUS"), for a regex to step over
 URL_LOCALE_SEGMENT = (
@@ -215,7 +217,7 @@ def _make_patterns():
             # (?<![a-z0-9.-]) keeps "a.b.myworkdayjobs.com" from reading "b" as a bare tenant.
             r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])"
             r"(?:\.(?=[:/]))?(?::\d+)?"   # a host may be written with its terminal dot
-            r"(?:/" + _WORKDAY_PATH + r")?",
+            r"(?:/" + WORKDAY_PATH + r")?",
             re.IGNORECASE
         ),
         "workday",
@@ -248,7 +250,7 @@ def _make_patterns():
             r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com\.?(?::\d+)?/"
             r"(?:" + URL_LOCALE_SEGMENT + r"/)?"   # optional locale: en-US, fr-FR, pt_BR
             r"recruiting/([a-z0-9-]+)" + URL_SEGMENT_END +   # the whole tenant segment
-            r"(?:/" + _WORKDAY_PATH + r")?",   # the site part is optional: the URL may end at the tenant
+            r"(?:/" + WORKDAY_PATH + r")?",   # the site part is optional: the URL may end at the tenant
             re.IGNORECASE
         ),
         "workday",
@@ -620,9 +622,10 @@ def match_ats_pattern(url, own_url=False):
     Try all ATS URL patterns against a URL.
     Returns {platform, slug} or None.
 
-    own_url=True: `url` is one pasted link, not free text. Only a match that begins in its own
-    scheme/host counts, so a link inside its path or query cannot decide the platform. A pattern
-    for fixed hosts (jobs.ea.com, ...) also needs the link's hostname to equal one of them. User
+    own_url=True: `url` is one pasted link, not free text. Only a match that begins at the start of
+    its own hostname (or earlier, at the scheme) counts, so neither a link inside its path or query
+    nor the tail of a longer host ("xjobs.lever.co") can decide the platform. A pattern for fixed
+    hosts (jobs.ea.com, ...) instead needs the link's hostname to equal one of them. User
     information ("user@") is dropped first: it is not the host. A "/url?q=" redirect is followed
     only from a Google origin; a pasted one from any other origin matches nothing. A sitemap is
     recognised from the link's own path, and keeps its query.
@@ -667,7 +670,8 @@ def match_ats_pattern(url, own_url=False):
         # Every match is tried: an earlier one may be rejected (e.g. jobs.myworkdayjobs.com)
         # while a later one in the same text is a real tenant.
         for m in pattern.finditer(text):
-            if m.start() >= start_limit:
+            # past the host never counts; inside it only for a fixed-host pattern, checked above
+            if m.start() >= start_limit or (own_url and not hosts and m.start() > at):
                 break
             try:
                 slug = extractor(m)
