@@ -336,9 +336,10 @@ The verdict is persisted: `_verify_jobvite_feed` (`workers/fullscan.py`) stores 
 ### ⚪ Workday boards over 2000 jobs lost their oldest jobs
 **Resolved:** 2026-10-14 (needs VM deploy)
 **Was:** Workday caps every search at 2000 results (Nvidia 2701 real, reported total 2000); offsets past the cap repeat. Also, a failed/empty page mid-pagination ended the loop silently.
-**Fix:** when page 1 reports total ≥ `WORKDAY_FACET_SPLIT_AT` (1900) the unsplit query is not paged; one query per `jobFamilyGroup` value is fetched (sub-split by `timeType`/`workerSubType` if a slice is still too big) and merged by `externalPath`. Warns when a slice cannot be split, distinct < facet-count sum, or a page fails/is empty before the total.
-**Effect:** big boards (Nvidia, T-Mobile, Genpact, Target, Citibank, Capital One, Bank of America, Applied Materials, General Hospital) return their full list: more jobs, burst of "new" older jobs on first scan, longer scans.
-**Files:** `jobs/ats/workday.py`, `config.py` (`WORKDAY_PAGE_SIZE`, `WORKDAY_RESULT_CAP`, `WORKDAY_FACET_SPLIT_AT`, `WORKDAY_SPLIT_FACETS`), `tests/test_workday_split.py`
+**Fix (superseded 2026-11, see the planner in `jobs/ats/workday.py`):** the first fix split on a fixed 1900 threshold and a fixed facet list. It now probes per tenant whether the cap applies (uncapped boards such as Bank of America page flat) and a cost-score planner picks the cheapest facet per slice (nested up to `WORKDAY_PLAN_MAX_DEPTH`); leaves are paged and merged by job key, gaps are closed by a direct window then searchText, and a request budget hard-stops runaway plans. Accenture is fetched US-only. Job id = req id from the externalPath token. A split node still short by more than `max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL × node size)` after recovery, or a flat board whose leaf came back short, ends the scan as `page_cap` (incomplete); a failed request ends it as `request_failed`.
+**Complete is not an exact count:** a smaller gap is accepted by the planner, and the fetch report then calls the scan complete when the distinct jobs are within `FETCH_TOLERANCE_PCT` of the total, while still reporting a nonzero shortfall (under the defaults, 2,290 of 2,300 jobs reads complete, shortfall 10).
+**Effect:** big boards (Nvidia, T-Mobile, Genpact, Target, Citibank, Capital One, Bank of America, Applied Materials, General Hospital) return far more of their list (complete in the sense above when the fetch report says so; an adaptive early exit leaves completeness unknown): more jobs, burst of "new" older jobs on first scan, longer scans.
+**Files:** `jobs/ats/workday.py`, `config.py` (`WORKDAY_*`), `tests/test_workday_split.py`
 
 ---
 

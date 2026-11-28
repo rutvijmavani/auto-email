@@ -128,8 +128,26 @@ FETCH_SERVER_SHORT_MIN_PCT  = float(os.getenv("FETCH_SERVER_SHORT_MIN_PCT", "50"
 # jobs/ats/workday.py — Workday caps each search at WORKDAY_RESULT_CAP results regardless of the real board size
 WORKDAY_PAGE_SIZE           = int(os.getenv("WORKDAY_PAGE_SIZE", "20"))          # Workday rejects larger limits
 WORKDAY_RESULT_CAP          = int(os.getenv("WORKDAY_RESULT_CAP", "2000"))       # observed hard ceiling of `total` (Nvidia, T-Mobile)
-WORKDAY_FACET_SPLIT_AT      = int(os.getenv("WORKDAY_FACET_SPLIT_AT", "1900"))   # total >= this → fetch one query per facet value
-WORKDAY_SPLIT_FACETS        = tuple(os.getenv("WORKDAY_SPLIT_FACETS", "jobFamilyGroup,timeType,workerSubType,locations").split(","))  # tried in order; `locations` = city, nested under locationMainGroup (Accenture)
+# Workday partial-fetch planner (docs/workday-partial-fetch-design.md)
+WORKDAY_FACET_SUM_TOL       = float(os.getenv("WORKDAY_FACET_SUM_TOL", "0.02"))    # facet sums within this fraction of each other agree on the board size
+WORKDAY_FACET_FLOOR         = float(os.getenv("WORKDAY_FACET_FLOOR", "0.9"))       # a facet must cover at least this share of its slice
+WORKDAY_FACET_MAXSHARE      = float(os.getenv("WORKDAY_FACET_MAXSHARE", "0.9"))    # prefer facets whose biggest value is at most this share of the slice
+WORKDAY_GAP_PENALTY         = float(os.getenv("WORKDAY_GAP_PENALTY", "20"))        # score: a job the facet would miss costs as much as this many requests
+WORKDAY_PLAN_MAX_DEPTH      = int(os.getenv("WORKDAY_PLAN_MAX_DEPTH", "5"))        # deepest facet nesting the planner will split
+WORKDAY_GAP_TOL             = float(os.getenv("WORKDAY_GAP_TOL", "0.005"))         # node-level gap (fraction) still treated as complete
+WORKDAY_GAP_MIN             = int(os.getenv("WORKDAY_GAP_MIN", "10"))              # node-level gap (jobs) always tolerated
+WORKDAY_WINDOW_MAX          = int(os.getenv("WORKDAY_WINDOW_MAX", "2"))            # direct window only for nodes up to this many x WORKDAY_RESULT_CAP
+WORKDAY_SEARCH_CHUNK_PAGES  = int(os.getenv("WORKDAY_SEARCH_CHUNK_PAGES", "10"))   # pages per searchText chunk (x WORKDAY_PAGE_SIZE rows)
+WORKDAY_SEARCH_MIN_NEW      = float(os.getenv("WORKDAY_SEARCH_MIN_NEW", "0.05"))   # stop a search term when a chunk adds under this share of new jobs
+WORKDAY_SEARCH_IDLE_TERMS   = int(os.getenv("WORKDAY_SEARCH_IDLE_TERMS", "3"))     # stop a node after this many search terms in a row add nothing
+WORKDAY_SEARCH_TERM_MIN_LEN = int(os.getenv("WORKDAY_SEARCH_TERM_MIN_LEN", "4"))   # shortest title word used as a search term
+WORKDAY_SEARCH_STOPWORDS    = frozenset(os.getenv("WORKDAY_SEARCH_STOPWORDS", "and,the,for,with,of,in,to,at,a,an,senior,junior,lead,manager,analyst,specialist,associate,new").split(","))  # title words never used as search terms
+WORKDAY_BUDGET_SLACK        = float(os.getenv("WORKDAY_BUDGET_SLACK", "0.10"))     # request budget = planned x (1 + this) + WORKDAY_BUDGET_PAD per slice; hard stop
+WORKDAY_BUDGET_PAD          = int(os.getenv("WORKDAY_BUDGET_PAD", "2"))            # extra requests per slice in the request budget
+# Accenture reports ~40k jobs but only US jobs are kept: fetch the US country facet only (tenant slug -> facet name, descriptor)
+WORKDAY_COUNTRY_FILTER_TENANT     = os.getenv("WORKDAY_COUNTRY_FILTER_TENANT", "accenture")                    # Workday tenant slug that gets the filter
+WORKDAY_COUNTRY_FILTER_FACET      = os.getenv("WORKDAY_COUNTRY_FILTER_FACET", "locationCountry")               # facet id used in appliedFacets
+WORKDAY_COUNTRY_FILTER_DESCRIPTOR = os.getenv("WORKDAY_COUNTRY_FILTER_DESCRIPTOR", "United States of America")  # facet value looked up on page 1
 
 # jobs/ats/jibe.py — page-count safety cap (loop normally ends at totalCount; this only bounds a runaway feed)
 JIBE_MAX_PAGES              = int(os.getenv("JIBE_MAX_PAGES", "200"))            # x 100 per page = 20,000 jobs

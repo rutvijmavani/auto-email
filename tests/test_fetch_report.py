@@ -99,24 +99,23 @@ def test_successfactors_no_config_and_no_feed():
 
 
 def test_workday_small_board_complete():
-    r = report_of(tw._run(tw._board({"eng": list(range(30))})))
+    r = report_of(tw._run(tw.Board(tw._jobs(30, fam="eng"))))
     assert r.complete is True and r.reported_total == 30 and r.total_source == "ats"
 
 
 def test_workday_split_uses_facet_sum():
-    groups = {"eng": list(range(0, 1500)), "sales": list(range(1500, 2300)), "ops": list(range(2300, 2700))}
-    r = report_of(tw._run(tw._board(groups)))
+    rows = tw._jobs(1500, fam="eng") + tw._jobs(800, 1500, fam="sales") + tw._jobs(400, 2300, fam="ops")
+    r = report_of(tw._run(tw.Board(rows)))
     assert r.complete is True and r.total_source == "facet_sum" and r.reported_total == 2700
 
 
 def test_workday_unsplittable_slice_is_page_cap():
-    groups = {"eng": list(range(0, 2500)), "sales": list(range(2500, 2600))}
-    r = report_of(tw._run(tw._board(groups)))
+    r = report_of(tw._run(tw.Board(tw._jobs(2500, fam="eng") + tw._jobs(100, 2500, fam="sales"))))
     assert r.complete is False and r.stop_reason == STOP_PAGE_CAP and r.shortfall == 500
 
 
 def test_workday_failed_page_is_incomplete():
-    fake = tw._board({"eng": list(range(100))})
+    fake = tw.Board(tw._jobs(100, fam="eng"))
     r = report_of(tw._run(lambda url, body=None, **kw: None if body["offset"] >= 40 else fake(url, body=body, **kw)))
     assert r.complete is False and r.stop_reason == STOP_REQUEST_FAILED
 

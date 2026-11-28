@@ -8,11 +8,122 @@
 
 import re
 import json
+import string
 
 # ─────────────────────────────────────────
 # URL PATTERNS
 # Each entry: (compiled_regex, platform, slug_extractor_fn)
 # ─────────────────────────────────────────
+
+# Hosts that are Workday aggregator / portal / marketing sites, never a tenant. Only matters for
+# the bare form ({tenant}.myworkdayjobs.com); the wdN form was never ambiguous. Shared by
+# patterns.py, career_detector.py and build_ats_slug_list.py.
+WORKDAY_NON_TENANT = frozenset({
+    "jobs", "apply", "www", "careers", "secure", "community", "wd", "impl", "myworkday",
+})
+
+# What may follow a whole URL path segment: the end, the next URL part, what closes a link in text or
+# markup, or sentence punctuation. Anything else ("fmr+test") means the segment goes on.
+URL_SEGMENT_END = r"""(?=$|[/?#&\s"'<>\\)\]}|`*]|[^\w\x00-\x7f]|[.,;:!](?![a-z0-9]))"""
+_SEGMENT_END = re.compile(URL_SEGMENT_END, re.IGNORECASE)
+
+_SITEMAP_MARKER = r"(?:sitemap[^\s]*\.xml|feed\.xml)"   # what makes a URL a sitemap / XML feed
+
+# The path of a Workday link, from its first segment on: segments (empty ones included, "en-US//Site")
+# of the characters a site name is written with. It ends at the first other character: the query, what
+# closes a link in text or markup, a template placeholder ("${site}"). Shared by patterns.py and
+# career_detector.py; workday_site picks the site out of it.
+WORKDAY_PATH = r"((?:[a-zA-Z0-9_%-]*/)*[a-zA-Z0-9_%-]*)"
+_WORKDAY_LOCALE = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
+# a locale path segment as written in a URL ("en-US", "en%2DUS"), for a regex to step over
+URL_LOCALE_SEGMENT = (
+    r"(?:[a-z]|%6[1-9A-Fa-f]|%7[0-9Aa]){2}(?:[-_]|%2[Dd]|%5[Ff])(?:[A-Z]|%4[1-9A-Fa-f]|%5[0-9Aa]){2}"
+)
+
+# a "/" written as JSON ("\/", "/", also double-escaped) or as an HTML entity. Shared by
+# patterns.py and career_detector.py.
+# The lookbehind starts a match only at the head of a backslash run: no rescanning of a long run.
+ENCODED_SLASH = re.compile(r'(?<!\\)\\+(?:/|u002f)|&#(?:x2f|47);', re.IGNORECASE)
+
+_UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
+
+
+def decode_unreserved(segment):
+    """A URL path segment with its percent-encoded unreserved characters decoded ("%45xternal" ->
+    "External"). Every other escape ("%2F", "%20") stays as written. Shared by patterns.py,
+    career_detector.py and build_ats_slug_list.py."""
+    def decoded(m):
+        char = chr(int(m.group(1), 16))
+        return char if char in _UNRESERVED else m.group(0)
+    return re.sub(r"%([0-9A-Fa-f]{2})", decoded, segment)
+
+
+def workday_site_segments(segments):
+    """The segments of a Workday link's path from the career site on: locales are dropped, and an API
+    link (/wday/cxs/{tenant}/{site}/...) starts after the tenant. Empty when the path names no site.
+    Shared by patterns.py, career_detector.py (through workday_site) and build_ats_slug_list.py."""
+    parts = [p for p in segments if p and not _WORKDAY_LOCALE.match(p)]
+    if parts[:1] == ["wday"]:   # "wday" is Workday's API prefix, never a career site
+        parts = parts[3:] if parts[1:2] == ["cxs"] else []
+    return parts
+
+
+def workday_site(path):
+    """The career site of a Workday link's path (see workday_site_segments), without trailing sentence
+    punctuation; "" when the path names none."""
+    parts = workday_site_segments(
+        decode_unreserved(p).rstrip(".,;:!") for p in (path or "").split("/"))
+    return parts[0] if parts else ""
+
+
+def workday_site_cut(m):
+    """True when the Workday match `m` (WORKDAY_PATH is group 3) stops inside the segment that would
+    name the site ("External+Preview"): such a link names a site that cannot be read, so it counts
+    neither for the part read nor for the tenant root. Shared by patterns.py and career_detector.py."""
+    path = m.group(3)
+    if not path or path.endswith("/") or _SEGMENT_END.match(m.string, m.end(3)):
+        return False
+    return not workday_site(path.rpartition("/")[0])   # a segment after the site may be cut short
+
+
+# where one URL or word ends in HTML/JS/JSON text (literal escapes and quote/angle entities included)
+_URL_TOKEN_BREAK = re.compile(
+    r'''\\[nrt]|\\u00(?:22|27|3[ce])|&(?:quot|apos|lt|gt|nbsp|#0?3[49]|#x2[27]);|[\s"'<>()\[\]{}|`]''',
+    re.IGNORECASE,
+)
+# all that may stand between that break and a URL's host: "href=" / "Careers:", a scheme or "//", user info
+_URL_AUTHORITY_LEAD = re.compile(
+    r'(?:[^/?#&@]*[=:])?(?:(?:https?:)?(?:\\*/){2}(?:[^/?#\\]*@)?)?', re.IGNORECASE,
+)
+URL_LEAD_WINDOW = 2048   # a longer unbroken run before a host is the inside of a URL
+
+
+def is_url_authority(text, start):
+    """True when the host at `start` is the enclosing URL's own host (or stands alone), not text inside
+    another URL's path or query, or the domain of an email address. Shared by patterns.py and
+    career_detector.py."""
+    lo = max(0, start - URL_LEAD_WINDOW)
+    parts = _URL_TOKEN_BREAK.split(text[lo:start])
+    if lo and len(parts) == 1:
+        return False
+    lead = re.sub(r'&#(?:x2f|47);', '/', parts[-1], flags=re.IGNORECASE)
+    return bool(_URL_AUTHORITY_LEAD.fullmatch(lead))
+
+
+# a scheme (and optional user info) written directly before a host
+_URL_OWN_SCHEME = re.compile(r'''https?:(?:\\*/){2}(?:[^/?#\\\s"'<>@]*@)?\Z''', re.IGNORECASE)
+
+
+def is_site_link(text, start):
+    """True when a host that is followed by a career site is a link: the enclosing URL's own host, or a
+    whole link with its own scheme carried inside another ("?u=https://..."). Host-like text that is
+    merely part of another URL's path or query is neither. Shared by patterns.py and
+    career_detector.py."""
+    if is_url_authority(text, start):
+        return True
+    lead = re.sub(r'&#(?:x2f|47);', '/', text[max(0, start - URL_LEAD_WINDOW):start], flags=re.IGNORECASE)
+    return bool(_URL_OWN_SCHEME.search(lead))
+
 
 def _make_patterns():
     patterns = []
@@ -94,25 +205,30 @@ def _make_patterns():
     #   e.g. /en-US/NVIDIAExternalCareerSite/job/...
     #        /NVIDIAExternalCareerSite/job/...
     # We always want the career site name, not the locale prefix.
-    _LOCALE_PATTERN = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
-
     def _workday_slug(m):
-        raw_path = m.group(3).rstrip("/")
-        parts    = [p for p in raw_path.split("/") if p]
-        # Skip locale prefix (en-US, fr-FR, zh-CN, etc.)
-        path = next(
-            (p for p in parts if not _LOCALE_PATTERN.match(p)),
-            parts[0] if parts else "careers"
-        )
+        tenant = m.group(1).lower()
+        wd     = (m.group(2) or "").lower()   # "" = bare host ({tenant}.myworkdayjobs.com)
+        if (not wd and tenant in WORKDAY_NON_TENANT) or workday_site_cut(m):
+            return None
         return json.dumps({
-            "slug": m.group(1).lower(),
-            "wd":   m.group(2).lower(),
-            "path": path or "careers",
+            "slug": tenant,
+            "wd":   wd,
+            # bare host or locale-only path: never use the locale as the site
+            "path": workday_site(m.group(3)) or "careers",
         })
+
+    def _workday_root_only(m):
+        """True when the match names no career site (bare host or locale-only path)."""
+        return not workday_site(m.group(3))
+
+    _workday_slug.root_only = _workday_root_only
 
     patterns.append((
         re.compile(
-            r"([a-z0-9]+)\.(wd\d+)\.myworkdayjobs\.com/([^?&#\s]*)",
+            # (?<![a-z0-9.-]) keeps "a.b.myworkdayjobs.com" from reading "b" as a bare tenant.
+            r"(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])"
+            r"(?:\.(?=[:/]))?(?::\d+)?"   # a host may be written with its terminal dot
+            r"(?:/" + WORKDAY_PATH + r")?",
             re.IGNORECASE
         ),
         "workday",
@@ -122,28 +238,32 @@ def _make_patterns():
     # Workday (alternate domain) — {wd}.myworkdaysite.com/recruiting/{tenant}/{career_site}
     # e.g. wd1.myworkdaysite.com/recruiting/fmr/FidelityCareers/...
     # API: wd1.myworkdaysite.com/wday/cxs/{tenant}/{career_site}/jobs
-    _LOCALE_PATTERN2 = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
-
     def _workdaysite_slug(m):
+        if workday_site_cut(m):
+            return None
         wd     = m.group(1).lower()
         tenant = m.group(2).lower()
-        parts  = [p for p in m.group(3).strip("/").split("/") if p]
-        path   = next(
-            (p for p in parts if not _LOCALE_PATTERN2.match(p)),
-            parts[0] if parts else "careers"
-        )
         return json.dumps({
             "slug": tenant,
             "wd":   wd,
-            "path": path,
+            # nothing or only a locale: never use the locale as the site
+            "path": workday_site(m.group(3)) or "careers",
             "site": "myworkdaysite",  # flag different base URL
         })
 
+    def _workdaysite_root_only(m):
+        """True when the match names no career site (nothing or only a locale after the tenant)."""
+        return not workday_site(m.group(3))
+
+    _workdaysite_slug.root_only = _workdaysite_root_only
+
     patterns.append((
         re.compile(
-            r"(wd\d+)\.myworkdaysite\.com/"
-            r"(?:[a-z]{2}[-_][A-Z]{2}/)?"   # optional locale: en-US, fr-FR, pt_BR
-            r"recruiting/([a-z0-9]+)/([^?&#\s]*)",
+            # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
+            r"(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com\.?(?::\d+)?/"
+            r"(?:" + URL_LOCALE_SEGMENT + r"/)?"   # optional locale: en-US, fr-FR, pt_BR
+            r"recruiting/([a-z0-9-]+)" + URL_SEGMENT_END +   # the whole tenant segment
+            r"(?:/" + WORKDAY_PATH + r")?",   # the site part is optional: the URL may end at the tenant
             re.IGNORECASE
         ),
         "workday",
@@ -272,12 +392,18 @@ def _make_patterns():
         lambda m: json.dumps({"base": f"https://{m.group(1)}.avature.net", "path": "careers"}),
     ))
 
+    def _on_hosts(extractor, *hosts):
+        """Mark a fixed-host pattern: a pasted link (own_url) must be on exactly one of `hosts`."""
+        extractor.hosts = hosts
+        return extractor
+
     # Avature custom domains
     for _domain, _path in [("jobs.ea.com", "en_US/careers")]:
         patterns.append((
             re.compile(re.escape(_domain), re.IGNORECASE),
             "avature",
-            lambda m, d=_domain, p=_path: json.dumps({"base": f"https://{d}", "path": p}),
+            _on_hosts(lambda m, d=_domain, p=_path: json.dumps({"base": f"https://{d}", "path": p}),
+                      _domain),
         ))
 
     # ── Phenom People (custom domains) ──────────────────────────────────────────
@@ -293,11 +419,11 @@ def _make_patterns():
             re.compile(re.escape(_phenom_domain), re.IGNORECASE),
             "phenom",
             # Use default args to capture loop variables
-            lambda m, d=_phenom_domain, p=_phenom_path: json.dumps({
+            _on_hosts(lambda m, d=_phenom_domain, p=_phenom_path: json.dumps({
                 "base":    f"https://{d}",
                 "path":    p,
                 "sitemap": f"{p}/sitemap.xml",
-            }),
+            }), _phenom_domain),
         ))
 
     # ── TalentBrew / Radancy ─────────────────────────────────────────────────────
@@ -311,10 +437,10 @@ def _make_patterns():
         patterns.append((
             re.compile(re.escape(_tb_domain), re.IGNORECASE),
             "talentbrew",
-            lambda m, d=_tb_domain, t=_tb_tenant: json.dumps({
+            _on_hosts(lambda m, d=_tb_domain, t=_tb_tenant: json.dumps({
                 "base":      f"https://{d}",
                 "tenant_id": t,
-            }),
+            }), _tb_domain),
         ))
 
     # ── Google Careers XML feed ──────────────────────────────────────────────────
@@ -322,7 +448,7 @@ def _make_patterns():
     patterns.append((
         re.compile(r"google\.com/about/careers/applications/jobs/feed\.xml", re.IGNORECASE),
         "google",
-        lambda m: "{}",
+        _on_hosts(lambda m: "{}", "google.com", "www.google.com"),
     ))
 
     # Taleo — {company}.taleo.net/careersection/...
@@ -346,7 +472,7 @@ def _make_patterns():
     patterns.append((
         re.compile(r"jobs\.apple\.com/", re.IGNORECASE),
         "apple",
-        lambda m: "{}",
+        _on_hosts(lambda m: "{}", "jobs.apple.com"),
     ))
 
     # Eightfold.ai — {slug}.eightfold.ai/careers
@@ -386,7 +512,7 @@ def _make_patterns():
     # NOTE: This pattern is intentionally broad — only matched when URL
     # explicitly contains sitemap.xml or feed.xml
     patterns.append((
-        re.compile(r"(https?://[^\s]+(?:sitemap[^\s]*\.xml|feed\.xml))", re.IGNORECASE),
+        re.compile(r"(https?://[^\s]+" + _SITEMAP_MARKER + r")", re.IGNORECASE),
         "sitemap",
         lambda m: json.dumps({"url": m.group(1)}),
     ))
@@ -504,28 +630,89 @@ def get_slug_keywords(company):
     return all_kw
 
 
-def match_ats_pattern(url):
+def match_ats_pattern(url, own_url=False):
     """
     Try all ATS URL patterns against a URL.
     Returns {platform, slug} or None.
+
+    own_url=True: `url` is one pasted link, not free text. Only a match that begins at the start of
+    its own hostname (or earlier, at the scheme) counts, so neither a link inside its path or query
+    nor the tail of a longer host ("xjobs.lever.co") can decide the platform. A pattern for fixed
+    hosts (jobs.ea.com, ...) instead needs the link's hostname to equal one of them. User
+    information ("user@") is dropped first: it is not the host. A "/url?q=" redirect is followed
+    only from a Google origin; a pasted one from any other origin matches nothing. A sitemap is
+    recognised from the link's own path, and keeps its query. A sitemap on a Workday host is a
+    sitemap: the first part of its path is not a career site.
     """
     if not url:
         return None
 
+    if own_url:
+        redirect = _redirect_parts(url)
+        if redirect and not _is_google_origin(redirect[0]):
+            return None
+
     # Decode Google redirect URLs
     url = _decode_google_redirect(url)
 
+    start_limit = len(url)   # matches must start before this index
+    own_feed = False   # the pasted link's own path names a sitemap / XML feed
+    if own_url:
+        from urllib.parse import urlsplit
+        try:
+            split = urlsplit(url)
+            netloc = split.netloc
+            own_host = (split.hostname or "").removesuffix(".")
+        except ValueError:
+            return None
+        at = url.find(netloc)
+        if at < 0:   # urlsplit removed characters (tab/newline) from the host: not a clean pasted URL
+            return None
+        host = netloc.rsplit("@", 1)[-1]
+        url = url[:at] + host + url[at + len(netloc):]
+        start_limit = at + len(host)
+        own_feed = bool(re.search(_SITEMAP_MARKER, split.path, re.IGNORECASE))
+
+    # Workday links in free text may be escaped ("https:\/\/..."): read them with plain slashes,
+    # so the career site after the host is seen. A pasted link is taken as written.
+    workday_text = url if own_url else ENCODED_SLASH.sub("/", url)
+
+    root_only = None   # a workday match that names no career site: kept while an explicit site is looked for
     for pattern, platform, extractor in ATS_URL_PATTERNS:
-        m = pattern.search(url)
-        if m:
+        text = workday_text if platform == "workday" else url
+        hosts = getattr(extractor, "hosts", None)
+        if own_url and hosts and own_host not in hosts:
+            continue   # "xjobs.ea.com" and "jobs.ea.com.example.org" only contain the host's name
+        if own_feed and platform == "workday":
+            continue   # "/External/siteMap.xml" would otherwise read as the board "External"
+        # Every match is tried: an earlier one may be rejected (e.g. jobs.myworkdayjobs.com)
+        # while a later one in the same text is a real tenant.
+        for m in pattern.finditer(text):
+            # past the host never counts; inside it only for a fixed-host pattern, checked above
+            if m.start() >= start_limit or (own_url and not hosts and m.start() > at):
+                break
             try:
                 slug = extractor(m)
-                if slug:
-                    return {"platform": platform, "slug": slug}
+                bare = bool(slug) and getattr(extractor, "root_only", lambda _m: False)(m)
             except Exception:
                 continue
+            if own_url and platform == "sitemap":
+                # its match always begins at the scheme, so the start limit proves nothing
+                if not own_feed:
+                    continue
+                slug = json.dumps({"url": url.split("#", 1)[0]})   # the query may select the feed
+            if slug and bare:
+                # a root says nothing but its host, so it counts only as a URL's own host or alone,
+                # not as the domain of an email address or as text inside another URL
+                if root_only is None and is_url_authority(text, m.start()):
+                    root_only = {"platform": platform, "slug": slug}
+                continue
+            if slug:
+                if platform == "workday" and not is_site_link(text, m.start()):
+                    continue   # host-like text inside another URL, or an email domain
+                return {"platform": platform, "slug": slug}
 
-    return None
+    return root_only
 
 
 def validate_slug_for_company(slug, company):
@@ -663,23 +850,41 @@ def validate_company_match(response_text, expected_company):
     return False
 
 
+_GOOGLE_HOST = re.compile(r'(?:www\.)?google\.(?:com?\.[a-z]{2}|com|[a-z]{2})\.?', re.IGNORECASE)
+
+
+def _redirect_parts(url):
+    """(parsed URL, "q" value) when `url` has the "/url?q=" redirect shape, else None."""
+    from urllib.parse import urlparse, parse_qs
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # Scraped HTML can contain "http://[..." — urlparse rejects the bracketed
+        # netlocs; treat as "not a redirect" and let the ATS regexes decide.
+        return None
+    if parsed.path != "/url":
+        return None
+    q = parse_qs(parsed.query).get("q")
+    return (parsed, q[0]) if q else None
+
+
+def _is_google_origin(parsed):
+    """A Google host, or a relative link (as scraped from a Google results page)."""
+    if not parsed.scheme and not parsed.netloc:
+        return True
+    return parsed.scheme in ("", "http", "https") and bool(_GOOGLE_HOST.fullmatch(parsed.hostname or ""))
+
+
 def _decode_google_redirect(url):
     """
     Handle Google redirect URLs:
     /url?q=https://boards.greenhouse.io/stripe/jobs&sa=...
     → https://boards.greenhouse.io/stripe/jobs
+    A redirect shape on any other host is returned unchanged.
     """
     if not url:
         return url
-    from urllib.parse import urlparse, parse_qs, unquote
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        # Scraped HTML can contain "http://[..." — urlparse rejects the bracketed
-        # netlocs; treat as "not a Google redirect" and let the ATS regexes decide.
-        return url
-    if parsed.path == "/url":
-        qs = parse_qs(parsed.query)
-        if "q" in qs:
-            return unquote(qs["q"][0])
+    redirect = _redirect_parts(url)
+    if redirect and _is_google_origin(redirect[0]):
+        return redirect[1]   # parse_qs already decoded it once; the target keeps its own escapes
     return url

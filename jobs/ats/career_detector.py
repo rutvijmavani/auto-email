@@ -273,21 +273,66 @@ def _extract_api_paths(bundle_text):
 # Each takes raw text, returns {"platform": ..., "slug": ...} or None
 # ─────────────────────────────────────────────────────────────────────────────
 
+from jobs.ats.patterns import ENCODED_SLASH as _ENCODED_SLASH
+from jobs.ats.patterns import URL_LOCALE_SEGMENT as _URL_LOCALE_SEGMENT
+from jobs.ats.patterns import URL_SEGMENT_END as _URL_SEGMENT_END
+from jobs.ats.patterns import WORKDAY_NON_TENANT as _WORKDAY_NON_TENANT
+from jobs.ats.patterns import WORKDAY_PATH as _WORKDAY_PATH
+from jobs.ats.patterns import is_site_link as _is_site_link
+from jobs.ats.patterns import is_url_authority as _is_url_authority
+from jobs.ats.patterns import workday_site as _workday_site
+from jobs.ats.patterns import workday_site_cut as _workday_site_cut
+
+
 def _extract_workday(text):
-    m = re.search(
-        r'([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com/([a-zA-Z0-9_%-][a-zA-Z0-9_%-]*)',
+    # wd group optional: bare host {tenant}.myworkdayjobs.com is stored as "wd": "".
+    text = _ENCODED_SLASH.sub('/', text)   # an escaped path still names its career site
+    root_only = None   # fallback: a match that names no career site (bare host or locale-only)
+    for m in re.finditer(
+        r'(?<![a-z0-9.-])([a-z0-9-]+)\.(?:(wd\d+)\.)?myworkdayjobs\.com(?![a-z0-9_-])(?!\.[a-z0-9])'
+        r'(?:\.(?=[:/]))?(?::\d+)?'   # a host may be written with its terminal dot
+        r'(?:/' + _WORKDAY_PATH + r')?',
         text, re.IGNORECASE,
-    )
-    if m:
-        slug = json.dumps({"slug": m.group(1), "wd": m.group(2), "path": m.group(3)})
+    ):
+        if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:
+            continue   # jobs./apply./www. aggregator hosts are not tenants
+        if _workday_site_cut(m):
+            continue   # an unreadable site name: neither a site nor a root
+        path = _workday_site(m.group(3))   # "" for a locale-only URL (e.g. /en-US/)
+        if not path:
+            # a root says nothing but its host, so it counts only as a URL's own host
+            if root_only is None and _is_url_authority(text, m.start()):
+                root_only = (m.group(1), m.group(2) or "")
+            continue   # keep scanning: a later link may name the real site
+        if not _is_site_link(text, m.start()):
+            continue
+        slug = json.dumps({"slug": m.group(1), "wd": m.group(2) or "", "path": path})
         return {"platform": "workday", "slug": slug}
-    # alternate myworkdaysite.com domain
-    m = re.search(
-        r'(wd\d+)\.myworkdaysite\.com/recruiting/([a-z0-9-]+)/([a-zA-Z0-9_%-]*)',
+    # alternate myworkdaysite.com domain: beats a root-only myworkdayjobs match
+    alt_root_only = None   # alternate-domain match that names no site: used if no later one names it
+    for m in re.finditer(
+        # the locale may sit before /recruiting/ or after the tenant
+        # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
+        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com\.?(?::\d+)?/(?:' + _URL_LOCALE_SEGMENT + r'/)?'
+        r'recruiting/([a-z0-9-]+)'
+        + _URL_SEGMENT_END +   # the whole tenant segment; the URL may end right after it
+        r'(?:/' + _WORKDAY_PATH + r')?',
         text, re.IGNORECASE,
-    )
-    if m:
-        slug = json.dumps({"slug": m.group(2), "wd": m.group(1), "path": m.group(3)})
+    ):
+        if _workday_site_cut(m):
+            continue   # an unreadable site name: neither a site nor a root
+        path = _workday_site(m.group(3))   # "" for a locale-only URL
+        info ={"slug": m.group(2), "wd": m.group(1), "path": path or "careers", "site": "myworkdaysite"}
+        if path:
+            if _is_site_link(text, m.start()):
+                return {"platform": "workday", "slug": json.dumps(info)}
+            continue
+        if alt_root_only is None and _is_url_authority(text, m.start()):
+            alt_root_only = info
+    if alt_root_only:
+        return {"platform": "workday", "slug": json.dumps(alt_root_only)}
+    if root_only:
+        slug = json.dumps({"slug": root_only[0], "wd": root_only[1], "path": "careers"})
         return {"platform": "workday", "slug": slug}
     return None
 

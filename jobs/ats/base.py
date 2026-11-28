@@ -5,10 +5,20 @@ import time
 import json
 import random
 import logging
+import threading
 import requests
 from config import JOB_MONITOR_API_TIMEOUT, PLATFORM_DELAYS
 
 logger = logging.getLogger(__name__)
+
+# Set by fetch_json_post: True when its last call ended on a Cloudflare challenge (not a rate limit
+# or outage), so a caller can skip a retry that can never succeed. Per thread.
+_post_state = threading.local()
+
+
+def last_post_was_challenge():
+    """True when this thread's last fetch_json_post call stopped on a Cloudflare challenge."""
+    return bool(getattr(_post_state, "challenge", False))
 
 
 # ─────────────────────────────────────────
@@ -135,18 +145,24 @@ def fetch_json(url, params=None, retries=2,
 
 
 def fetch_json_post(url, body=None, retries=2,
-                    platform=None, track=True, headers=None):
+                    platform=None, track=True, headers=None, before_retry=None):
     """
     POST JSON to URL and return parsed response.
     Used by Workday — requires POST with JSON body, not GET.
     Optional headers param allows callers to override default headers
     (e.g. Workday requires full browser headers for pagination to work).
+    before_retry: called once before each retry (not the first attempt); a false
+    result gives up at once (no wait) and returns None — for a caller's request budget.
     """
     default_headers = {
         "User-Agent":   "Mozilla/5.0",
         "Content-Type": "application/json",
     }
     request_headers = headers if headers is not None else default_headers
+    _post_state.challenge = False
+
+    def may_retry():
+        return attempt < retries and (before_retry is None or bool(before_retry()))
 
     for attempt in range(retries + 1):
         start_ms    = int(time.time() * 1000)
@@ -163,15 +179,39 @@ def fetch_json_post(url, body=None, retries=2,
             status_code = resp.status_code
             elapsed_ms  = int(time.time() * 1000) - start_ms
 
+            if status_code != 200:
+                # A Cloudflare challenge (cf-mitigated header), whatever its status
+                # (403, 429, 503), is neither a rate limit nor a passing error:
+                # waiting and retrying the same request never clears it. Record it
+                # once (a 429 with backoff 0, no sleep happened, plus the alert
+                # check) and give up at once so the caller marks the fetch
+                # incomplete. Only a real string value counts.
+                cf_header = resp.headers.get("cf-mitigated")
+                if isinstance(cf_header, str) and cf_header:
+                    if platform and track:
+                        if status_code == 429:
+                            _record(platform, 429, elapsed_ms, backoff_s=0)
+                            _check_rate_limit_alert(platform)
+                        else:
+                            _record(platform, status_code, elapsed_ms,
+                                    error_type=_status_error_type(status_code))
+                    logger.warning(
+                        "Cloudflare challenge (cf-mitigated=%s) on %s (POST) — not retrying",
+                        cf_header, platform or url
+                    )
+                    _post_state.challenge = True
+                    return None
+
             if status_code == 429:
                 # Same single-record rule as fetch_json; Workday (the main
                 # caller) previously recorded no backoff and never ran the
                 # rate-limit alert check.
-                backoff_s = 60 if attempt < retries else 0
+                retry = may_retry()
+                backoff_s = 60 if retry else 0
                 if platform and track:
                     _record(platform, 429, elapsed_ms, backoff_s=backoff_s)
                     _check_rate_limit_alert(platform)
-                if attempt < retries:
+                if retry:
                     # FJP: POST failures were silent; mirror fetch_json.
                     logger.warning(
                         "Rate limited on %s (POST) — waiting %ds",
@@ -189,7 +229,7 @@ def fetch_json_post(url, body=None, retries=2,
             if 500 <= status_code < 600:
                 # Transient server error — retry with backoff
                 backoff_s = 2 ** attempt
-                if attempt < retries:
+                if may_retry():
                     time.sleep(backoff_s)
                     continue
                 logger.debug("fetch_json_post: HTTP %d on %s, retries exhausted", status_code, url)
@@ -206,7 +246,7 @@ def fetch_json_post(url, body=None, retries=2,
             if platform and track:
                 _record(platform, 0, int(time.time() * 1000) - start_ms,
                         error_type="requests_timeout")
-            if attempt < retries:
+            if may_retry():
                 time.sleep(2 ** attempt)
                 continue
             logger.debug("fetch_json_post: timeout on %s, retries exhausted", url)
@@ -215,7 +255,7 @@ def fetch_json_post(url, body=None, retries=2,
             if platform and track:
                 _record(platform, 0, int(time.time() * 1000) - start_ms,
                         error_type="requests_conn_err")
-            if attempt < retries:
+            if may_retry():
                 # Same transient-failure handling as the Timeout branch (and fetch_json).
                 time.sleep(2 ** attempt)
                 continue

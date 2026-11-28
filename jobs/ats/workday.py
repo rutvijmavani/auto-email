@@ -2,14 +2,29 @@
 # Date field: postedOn (RELIABLE — original posting date)
 # Risk: undocumented — monitor for structural changes
 
+import collections
+import hashlib
+import json
 import logging
+import math
+import re
+import statistics
 from datetime import datetime
-from config import FETCH_TOLERANCE_PCT, WORKDAY_FACET_SPLIT_AT, WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP, WORKDAY_SPLIT_FACETS
-from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
+from urllib.parse import urlparse
+from config import (
+    WORKDAY_BUDGET_PAD, WORKDAY_COUNTRY_FILTER_DESCRIPTOR, WORKDAY_COUNTRY_FILTER_FACET,
+    WORKDAY_COUNTRY_FILTER_TENANT, WORKDAY_BUDGET_SLACK, WORKDAY_FACET_FLOOR, WORKDAY_FACET_MAXSHARE,
+    WORKDAY_FACET_SUM_TOL, WORKDAY_GAP_MIN, WORKDAY_GAP_PENALTY, WORKDAY_GAP_TOL, WORKDAY_PAGE_SIZE,
+    WORKDAY_PLAN_MAX_DEPTH, WORKDAY_RESULT_CAP, WORKDAY_SEARCH_CHUNK_PAGES, WORKDAY_SEARCH_IDLE_TERMS,
+    WORKDAY_SEARCH_MIN_NEW, WORKDAY_SEARCH_STOPWORDS, WORKDAY_SEARCH_TERM_MIN_LEN,
+    WORKDAY_WINDOW_MAX,
+)
+from jobs.ats.base import fetch_json, fetch_json_post, last_post_was_challenge, slugify, validate_company_match
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
     attach, count_distinct,
 )
+from jobs.ats.patterns import decode_unreserved
 from jobs.utils import clean_html
 
 logger = logging.getLogger(__name__)
@@ -20,12 +35,12 @@ WD_VARIANTS = [
     "wd6", "wd7", "wd8", "wd10", "wd12",
 ]
 
-BASE_URL      = "https://{slug}.{wd}.myworkdayjobs.com/wday/cxs/{slug}/{path}/jobs"
-BASE_URL_SITE = "https://{wd}.myworkdaysite.com/wday/cxs/{slug}/{path}/jobs"
-
-# Base domain — used to construct full job URLs
+# Base domain — used to construct full job URLs. A bare host ("wd": "") has no data-center label,
+# e.g. https://nxp.myworkdayjobs.com (see workday_domain()).
 BASE_DOMAIN      = "https://{slug}.{wd}.myworkdayjobs.com"
+BASE_DOMAIN_BARE = "https://{slug}.myworkdayjobs.com"
 BASE_DOMAIN_SITE = "https://{wd}.myworkdaysite.com"
+API_PATH         = "/wday/cxs/{slug}/{path}/jobs"
 
 WD_PATH_VARIANTS = [
     "careers",
@@ -45,23 +60,42 @@ WORKDAY_HEADERS = {
 }
 
 
+def wd_present(wd, site=None):
+    """
+    True when a stored `wd` / `_wd` value is usable (design: presence check, 2026-11-23).
+
+    The value must be a string (None = missing, and false or a number in stored JSON, are errors) but
+    it may be the empty string, which means the bare host {slug}.myworkdayjobs.com (NXP).
+    `myworkdaysite` tenants build the host FROM wd, so an empty value is never valid for them.
+    Every guard that used a truthiness test on wd/_wd uses this.
+    """
+    if not isinstance(wd, str):
+        return False
+    if wd == "" and site == "myworkdaysite":
+        return False
+    return True
+
+
+def workday_domain(slug, wd, site=None):
+    """Base domain (no trailing slash) for a Workday tenant; the one place the host is formatted."""
+    if site == "myworkdaysite":
+        return BASE_DOMAIN_SITE.format(wd=wd)
+    if wd == "":
+        return BASE_DOMAIN_BARE.format(slug=slug)
+    return BASE_DOMAIN.format(slug=slug, wd=wd)
+
+
 def _build_url(slug_info):
     """Build correct API URL based on which Workday domain is used."""
     slug = slug_info["slug"]
     wd   = slug_info["wd"]
     path = slug_info.get("path", "careers")
-    if slug_info.get("site") == "myworkdaysite":
-        return BASE_URL_SITE.format(slug=slug, wd=wd, path=path)
-    return BASE_URL.format(slug=slug, wd=wd, path=path)
+    return workday_domain(slug, wd, slug_info.get("site")) + API_PATH.format(slug=slug, path=path)
 
 
 def _build_domain(slug_info):
     """Build base domain for constructing full job URLs."""
-    slug = slug_info["slug"]
-    wd   = slug_info["wd"]
-    if slug_info.get("site") == "myworkdaysite":
-        return BASE_DOMAIN_SITE.format(wd=wd)
-    return BASE_DOMAIN.format(slug=slug, wd=wd)
+    return workday_domain(slug_info["slug"], slug_info["wd"], slug_info.get("site"))
 
 
 def detect(company):
@@ -109,28 +143,91 @@ def _get_path_variants(slug, company):
     return variants
 
 
+def _country_filter(url, company, rep):
+    """
+    appliedFacets for the one tenant that is read for a single country (Accenture: US only; non-US jobs are
+    deleted after the detail fetch anyway). The value id is looked up on page 1 of the unfiltered query each
+    scan, so a re-keyed id cannot break it. Returns {facet: [id]}, or None when page 1 failed, the board is
+    empty or the value is missing (rep["failed"] / rep["empty_board"] / rep["filter_missing"] say which).
+    """
+    data = _page1(url, {}, company, rep)
+    if data is None:
+        rep["failed"] = True
+        logger.warning("workday country filter: page 1 failed for %r", company)
+        return None
+    wanted = WORKDAY_COUNTRY_FILTER_DESCRIPTOR.strip().lower()
+    for f in _flatten_facets(data.get("facets") or []):
+        if f.get("facetParameter") != WORKDAY_COUNTRY_FILTER_FACET:
+            continue
+        for v in f.get("values") or []:
+            if isinstance(v, dict) and v.get("id") and str(v.get("descriptor", "")).strip().lower() == wanted:
+                return {WORKDAY_COUNTRY_FILTER_FACET: [v["id"]]}
+    # a reported total of 0 with no postings has nothing to filter; a response without a total says nothing
+    if type(data.get("total")) is int and data["total"] == 0 and not data.get("jobPostings"):
+        rep["empty_board"] = True
+        logger.info("workday country filter: %r reports an empty board", company)
+        return None
+    rep["filter_missing"] = True
+    logger.error("workday country filter: %r has no %r value in facet %s — not fetching the unfiltered board",
+                 company, WORKDAY_COUNTRY_FILTER_DESCRIPTOR, WORKDAY_COUNTRY_FILTER_FACET)
+    return None
+
+
+def _filter_missing_result(rep):
+    """Report for a scan with no country filter to apply (nothing fetched): complete for an empty board,
+    not complete when the filter could not be resolved."""
+    empty = rep.get("empty_board")
+    if empty:
+        stop = STOP_ALL_PAGES
+    else:
+        stop = STOP_NO_CONFIG if rep.get("filter_missing") else STOP_REQUEST_FAILED
+    return attach([], FetchReport(
+        stop_reason=stop, pages=rep["pages"], fetched_distinct=0, unusable=0,
+        reported_total=0 if empty else None, total_source=TOTAL_ATS,
+        note="" if empty else f"country filter {WORKDAY_COUNTRY_FILTER_DESCRIPTOR!r} not resolved",
+    ))
+
+
 def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs for company from Workday.
-    Handles pagination. stop_check: adaptive-scan EarlyExitGate (fresh gate per facet slice).
+    Plans, pages and recovers (see _plan_board). stop_check: adaptive-scan EarlyExitGate (fresh gate per leaf).
     Returns list of normalized job dicts.
     slug_info = {"slug": "att", "wd": "wd1", "path": "ATTGeneral"}
     """
+    if not wd_present(slug_info.get("wd"), slug_info.get("site")):
+        logger.warning("workday fetch: %r has no usable wd in %s — nothing fetched", company, slug_info)
+        return attach([], FetchReport(
+            stop_reason=STOP_NO_CONFIG, pages=0, fetched_distinct=0, unusable=0,
+            reported_total=None, total_source=TOTAL_ATS, note="wd missing",
+        ))
     url    = _build_url(slug_info)
     domain = _build_domain(slug_info)
     path   = slug_info.get("path", "careers")  # e.g. "ATTGeneral"
 
-    # Workday caps every query at WORKDAY_RESULT_CAP results (Nvidia reports total=2000 for 2700 jobs;
-    # offsets past the cap repeat the last page). A board at/above WORKDAY_FACET_SPLIT_AT is therefore
-    # fetched as one query per facet value (jobFamilyGroup, then timeType/workerSubType if a slice is
-    # still too large) and the slices are merged by job path.
-    rep      = {"pages": 0, "failed": False, "capped": False, "expected": None}
+    # Workday caps some tenants' queries at WORKDAY_RESULT_CAP results (Nvidia reports total=2000 for 2700 jobs;
+    # offsets past the cap repeat page 1). The planner (see _plan_board) probes the tenant once, splits a
+    # capped board into leaves below the cap, pages them one after another (early-exit gate per leaf),
+    # then closes gaps between promised and fetched counts (_recover). An uncapped board (BofA, Micron,
+    # CVS) is a single leaf paged flat.
+    rep = {"pages": 0, "failed": False, "capped": False, "expected": None, "capped_board": None}
     norm = None
     if stop_check is not None:
         def norm(j):
             return _normalize(j, company, domain, path, slug_info) if j.get("title") else None
-    first    = _fetch_pages(url, {}, company, defer_large=True, rep=rep, gate=stop_check, norm=norm)
-    all_jobs = _collect(url, {}, (), first, company, rep, first[1] or None, gate=stop_check, norm=norm)
+    base = {}
+    if str(slug_info.get("slug") or "").lower() == str(WORKDAY_COUNTRY_FILTER_TENANT).lower():
+        base = _country_filter(url, company, rep)
+        if base is None:   # no filter to apply: never fall back to the unfiltered board
+            return _filter_missing_result(rep)
+    leaves, nodes = _plan_board(url, company, rep, base)
+    merged, leaf_got = _fetch_leaves(url, leaves, company, rep, gate=stop_check, norm=norm)
+    if not nodes and any(got < k for _a, k, got in rep.get("leaf_mismatch", [])):
+        rep["capped"] = True   # a flat board has no node recovery: rows its leaf lost stay lost (extra rows lose none)
+    _keep_node_page1(nodes, merged, leaf_got, rep)
+    if not rep.get("blocked"):   # a Cloudflare challenge ends the scan: no recovery requests
+        _recover(url, nodes, merged, leaf_got, company, rep)
+    all_jobs = list(merged.values())
 
     results = []
     for j in all_jobs:
@@ -148,84 +245,111 @@ def fetch_jobs(slug_info, company, stop_check=None):
         stop = STOP_EARLY_EXIT
     else:
         stop = STOP_ALL_PAGES
-    split = rep["expected"] is not None
+    split = bool(nodes)   # a board no facet could split is reported by its root total
+    notes = ["split by facet"] if split else []
+    if rep.get("capped_slices"):
+        notes.append(f"{len(rep['capped_slices'])} slices over the cap with no usable facet")
+    if rep.get("partial"):
+        notes.append("nodes still short: " + "; ".join(f"{n} of {k}" for _a, k, n in rep["partial"]))
+    if rep.get("leaf_mismatch"):
+        notes.append(f"{len(rep['leaf_mismatch'])} leaves off their promised count")
+    if rep.get("over_budget"):
+        notes.append("request budget used up")
     return attach(results, FetchReport(
         stop_reason      = stop,
         pages            = rep["pages"],
         fetched_distinct = count_distinct(results),
         unusable         = len(all_jobs) - len(results),
-        reported_total   = rep["expected"] if split else first[1],
+        # split: the root node's target as it stands now (nodes[0] is the root)
+        reported_total   = _node_target(nodes[0], rep) if split else rep.get("reported", 0),
         total_source     = TOTAL_FACET_SUM if split else TOTAL_ATS,
-        note             = "split by facet" if split else "",
+        note             = "; ".join(notes),
     ))
 
 
+def _is_req_id(text):
+    """A bulletFields value shaped like a requisition id: no spaces, has a digit."""
+    return isinstance(text, str) and bool(re.fullmatch(r"\S*\d\S*", text))
+
+
+def _own_url_key(url):
+    """
+    The part of a posting's URL that names that posting alone, "" for a generic URL postings share.
+    A "/job/" URL gives its board-relative path, the form externalPath has (host, locale and site prefix
+    dropped); a legacy URL ending in a posting id (".../1", "..._R-12") gives the whole URL.
+    """
+    bare = url.split("#", 1)[0].split("?", 1)[0]    # tracking query/fragment must not make one posting two keys
+    try:
+        upath = urlparse(bare).path
+    except ValueError:   # malformed URL (e.g. "http://[..."): not posting-specific
+        return ""
+    last = upath.rstrip("/").rsplit("/", 1)[-1]
+    if "/job/" in upath:
+        return upath[upath.find("/job/"):]
+    if last.isdigit() or re.search(r"_(?:JR|R)-?\d+(?:-\d+)?$", last):
+        return bare
+    return ""
+
+
 def _job_key(posting):
-    """Identity of a listing across facet slices: its relative path, else req id, else title+location."""
-    return (posting.get("externalPath")
-            or (posting.get("bulletFields") or [""])[0]
-            or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
+    """Identity of a listing across facet slices: its relative path or posting URL, else req id, else its
+    title+location (with any other URL and bullets, so a URL or label shared by postings merges none),
+    encoded as a JSON list so that no two splits of those fields read the same. A path is compared with
+    its unreserved escapes decoded ("%45ng" is "Eng"); the posting keeps it as written."""
+    if posting.get("externalPath"):
+        return decode_unreserved(str(posting["externalPath"]))
+    url = posting.get("externalUrl") or ""
+    own = _own_url_key(url)
+    if own:
+        return decode_unreserved(own)
+    bullets = posting.get("bulletFields") or []
+    if bullets and _is_req_id(bullets[0]):
+        return bullets[0]
+    return json.dumps([posting.get("title", ""), posting.get("locationsText", ""), url, *bullets], default=str)
 
 
-def _fetch_pages(url, applied, company, defer_large=False, rep=None, gate=None, norm=None):
+def _board_is_capped(url, applied, first_jobs, rep, company):
     """
-    Page one query (optionally filtered by appliedFacets) until its reported total is reached.
+    Per-tenant yes/no cap probe (design P2). Called only when a query's total is at/above
+    WORKDAY_RESULT_CAP: on page 1 by the planner, or on a later page of a flat board that grew to it
+    (_fetch_leaf). Requests the page at offset WORKDAY_RESULT_CAP and compares it with page 1: a
+    capped tenant serves page 1 again (offsets past the cap repeat it), an uncapped one (BofA, Micron,
+    CVS) serves the next real page, or none when the board is exactly cap-sized.
 
-    Returns (postings, total, facets). `total` and `facets` come from page 1 only (later pages report
-    total=0 on some tenants). A failed or empty page before the total is reached stops the loop with a
-    WARNING instead of looking like a normal end of list.
-
-    defer_large: stop after page 1 when the total is at/above WORKDAY_FACET_SPLIT_AT — the caller splits
-    by facet instead, so paging the capped query would be wasted requests (_collect re-pages it in full
-    only when no facet can split it).
-
-    rep: optional dict collecting the completeness facts ("pages" count, "failed" on a failed or
-    short-ended page) for the FetchReport built in fetch_jobs.
-
-    gate / norm: adaptive-scan EarlyExitGate and the raw->normalized job function; the gate sees each
-    non-final page's normalized jobs and True ends this query ("early" is set on rep).
+    The answer is per tenant, so it is cached on `rep["capped_board"]` for the whole scan: the first
+    call (the unfiltered board) probes, every later call (a facet slice of that board) reuses it. A
+    failed probe is treated as capped (the facet split is the safe path) and is not cached, so the next
+    query retries it. With no `rep` there is nowhere to cache, so it probes each time.
     """
-    postings, offset, total, facets = [], 0, None, []
-    while True:
-        body = {"limit": WORKDAY_PAGE_SIZE, "offset": offset}
-        if applied:
-            body["appliedFacets"] = applied
-        data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS,
-                               platform="workday")  # tracked for api_health
-        if rep is not None:
-            rep["pages"] += 1
-        if not data:
-            if rep is not None:
-                rep["failed"] = True
-            # S0: log page 1 too — a failed first page is "0 fetched", not an empty board.
-            logger.warning("workday fetch: request failed at offset=%d (total=%s) for %r applied=%s "
-                           "— %s", offset, total, company, applied,
-                           "partial result" if (offset or total) else "no data")
-            break
-        jobs = data.get("jobPostings", [])
-        if total is None:
-            total  = data.get("total", 0)
-            facets = data.get("facets") or []
-        if not jobs:
-            if total and offset < total:
-                if rep is not None:
-                    rep["failed"] = True
-                logger.warning("workday fetch: empty page at offset=%d of total=%d for %r applied=%s "
-                               "— partial result", offset, total, company, applied)
-            break
-        postings.extend(jobs)
-        offset += len(jobs)
-        if offset >= total:
-            break
-        if defer_large and total >= WORKDAY_FACET_SPLIT_AT:
-            break
-        # Adaptive scan: a page of only already-seen jobs counts toward the gate's streak. Never on the
-        # last page (handled above) or on a deferred large query, so the board end stays STOP_ALL_PAGES.
-        if gate is not None and norm is not None and gate([j for j in map(norm, jobs) if j]):
-            if rep is not None:
-                rep["early"] = True
-            break
-    return postings, total or 0, facets
+    cached = None if rep is None else rep.get("capped_board")
+    if cached is not None:
+        return cached
+    first_keys = {_job_key(p) for p in first_jobs or []}
+    body = {"limit": WORKDAY_PAGE_SIZE, "offset": WORKDAY_RESULT_CAP}
+    if applied:
+        body["appliedFacets"] = applied
+    data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday",
+                           before_retry=None if rep is None else lambda: _charge_retry(rep))
+    if rep is not None:
+        rep["pages"] += 1
+    if not data:
+        if rep is not None and last_post_was_challenge():
+            rep["blocked"] = rep["failed"] = True
+        logger.warning("workday fetch: cap probe at offset=%d failed for %r — treating board as capped",
+                       WORKDAY_RESULT_CAP, company)
+        return True
+    probe_jobs = data.get("jobPostings") or []
+    if rep is not None:
+        # real rows of this query: kept for the result even if the scan stops before paging reaches them
+        rep.setdefault("probe_rows", []).append((dict(applied or {}), probe_jobs))
+    # capped = the probe page repeats page 1 (at least half of it); one shared key is not a repeat
+    capped = bool(probe_jobs) and bool(first_keys) \
+        and 2 * len(first_keys & {_job_key(p) for p in probe_jobs}) >= len(first_keys)
+    if rep is not None:
+        rep["capped_board"] = capped
+    logger.info("workday fetch: %r cap probe at offset=%d -> %s", company, WORKDAY_RESULT_CAP,
+                "capped" if capped else "uncapped (paged flat)")
+    return capped
 
 
 def _flatten_facets(facets):
@@ -245,73 +369,576 @@ def _flatten_facets(facets):
     return out
 
 
-def _pick_split_facet(facets, used):
-    """First configured split facet not yet applied that offers 2+ non-empty values; else (None, [])."""
-    by_name = {f.get("facetParameter"): f for f in _flatten_facets(facets)}
-    for name in WORKDAY_SPLIT_FACETS:
-        if name in used or name not in by_name:
-            continue
-        values = [v for v in by_name[name].get("values") or [] if v.get("id") and v.get("count", 0) > 0]
-        if len(values) >= 2:
-            return name, values
-    return None, []
+# ── Planner (design P3, step 9) ─────────────────────────────────────────────────────────────────────
+# A capped board is split by the facet with the lowest request cost into leaves (each below the cap),
+# the leaves are paged one after another, and every request counts against a hard budget. Not wired
+# fetch_jobs runs it: plan -> fetch leaves -> recover.
+
+class _OverBudget(Exception):
+    """The scan used its request budget: planned requests x (1 + slack) + a pad per slice."""
 
 
-def _collect(url, applied, used, first, company, rep=None, slice_count=None, gate=None, norm=None):
+def _budget_add(rep, cost):
+    """Raise the request budget for `cost` planned requests (one pad per call = per slice)."""
+    rep["budget"] = rep.get("budget", 0.0) + cost * (1 + WORKDAY_BUDGET_SLACK) + WORKDAY_BUDGET_PAD
+
+
+def _charge_retry(rep):
+    """Charge one retry inside fetch_json_post against the budget; False (no retry) once it is used up."""
+    if rep.get("logical", 0) >= rep.get("budget", 0.0):
+        logger.warning("workday fetch: request budget used up (%d requests) — retry skipped", rep.get("logical", 0))
+        return False
+    rep["logical"] = rep.get("logical", 0) + 1
+    return True
+
+
+def _post(url, applied, offset, company, rep, text=None, before_retry=None):
+    """One list request; it and each of its retries count against the budget. Raises _OverBudget when
+    nothing is left for it; returns the JSON or None. After a Cloudflare challenge nothing more is sent (None).
+    `before_retry` replaces the default retry check; it must charge the budget itself (_charge_retry)."""
+    if rep.get("blocked"):
+        return None
+    if rep.get("logical", 0) >= rep.get("budget", 0.0):
+        rep["over_budget"] = True
+        raise _OverBudget(f"{company}: {rep.get('logical', 0)} requests >= budget {rep.get('budget', 0.0):.0f}")
+    rep["logical"] = rep.get("logical", 0) + 1
+    rep["pages"] += 1
+    body = {"limit": WORKDAY_PAGE_SIZE, "offset": offset}
+    if applied:
+        body["appliedFacets"] = applied
+    if text:
+        body["searchText"] = text
+    data = fetch_json_post(url, body=body, headers=WORKDAY_HEADERS, platform="workday",
+                           before_retry=before_retry or (lambda: _charge_retry(rep)))
+    rep["challenge"] = (not data) and last_post_was_challenge()   # a Cloudflare challenge is not retried
+    if rep["challenge"]:
+        # the whole scan stops: no more pages, sibling leaves or recovery
+        rep["blocked"] = rep["failed"] = True
+    return data
+
+
+def _page1(url, applied, company, rep):
+    """Page 1 of a query (total, jobs, facets), cached per scan; None when the request failed."""
+    cache = rep.setdefault("node_page1", {})
+    k = json.dumps(applied, sort_keys=True)
+    if k in cache:
+        return cache[k]
+    _budget_add(rep, 1)
+    data = _post(url, applied, 0, company, rep)
+    if data:
+        cache[k] = data
+    return data or None
+
+
+def _facet_candidates(facets, used):
+    """(name, values, sum) for every unused facet with 2+ non-empty values (nested groups flattened)."""
+    out = []
+    for f in _flatten_facets(facets or []):
+        name = f.get("facetParameter")
+        vals = [v for v in f.get("values") or [] if isinstance(v, dict) and v.get("id") and v.get("count", 0) > 0]
+        if name and name not in used and len(vals) >= 2:
+            out.append((name, vals, sum(v["count"] for v in vals)))
+    return out
+
+
+def _board_size(cands):
+    """Median of the largest group of facet sums within WORKDAY_FACET_SUM_TOL of each other (tie: larger)."""
+    sums = sorted(s for _, _, s in cands if s > WORKDAY_PAGE_SIZE)
+    best = None
+    for a in sums:
+        members = [s for s in sums if abs(s - a) <= WORKDAY_FACET_SUM_TOL * a]
+        key = (len(members), statistics.median(members))
+        if best is None or key > best[0]:
+            best = (key, members)
+    return int(statistics.median(best[1])) if best else None
+
+
+def _facet_score(values, total, size):
+    """Request cost of splitting by this facet: its pages, +2 per value still at the cap, + a penalty
+    for jobs the facet would miss (size - total)."""
+    pages = sum(math.ceil(v["count"] / WORKDAY_PAGE_SIZE) for v in values)
+    over = sum(1 for v in values if v["count"] >= WORKDAY_RESULT_CAP)
+    return pages + 2 * over + WORKDAY_GAP_PENALTY * max(0, size - total) / WORKDAY_PAGE_SIZE
+
+
+def _choose_facet(cands, size):
+    """The cheapest candidate that covers most of the slice, preferring facets that really split it."""
+    ok = [c for c in cands if c[2] >= WORKDAY_FACET_FLOOR * size]
+    split = [c for c in ok if max(v["count"] for v in c[1]) <= WORKDAY_FACET_MAXSHARE * size] or ok
+    ranked = sorted(split, key=lambda c: _facet_score(c[1], c[2], size))
+    return ranked[0] if ranked else None
+
+
+def _distinct(rows):
+    """Number of different postings in a page: a repeated row does not fill the window."""
+    return len({_job_key(p) for p in rows})
+
+
+def _make_leaf(rep, applied, size, first=None, split=None):
+    """A query below the cap that is paged to its end. `first` = page 1 when already fetched.
+    `split` marks a planned leaf, which follows a total that rises (see _fetch_leaf): False for the flat
+    board, True for a slice of a split board. Left None, the leaf keeps its size."""
+    first = list(first or [])
+    # a cached page 1 that came back short is fetched again from offset 0; a full one costs no request
+    start = len(first) if _distinct(first) >= min(WORKDAY_PAGE_SIZE, size) else 0
+    offs = list(range(start, size, WORKDAY_PAGE_SIZE))
+    _budget_add(rep, len(offs))
+    leaf = {"applied": applied, "K": size, "first": first, "offs": offs}
+    if split is not None:
+        leaf.update(grows=True, split=split)
+    return leaf
+
+
+def _plan_board(url, company, rep, base=None):
     """
-    Return every posting reachable for `applied`: the plain paged result when it is under the split
-    threshold, otherwise the union (deduped by _job_key) of one query per facet value, recursing with
-    another facet when a slice is still at the threshold.
+    Iterative work list over the board. Returns (leaves, nodes): leaves are queries below the cap,
+    nodes are the capped queries that were split (applied, K, facet, depth, sum, used) for the recovery steps.
 
-    rep (see _fetch_pages) also receives "capped" when a slice cannot be split below the result cap, and
-    "expected" — the top-level facet-count sum — when the board was split.
-
-    slice_count: the parent facet's own count for this slice. A further split can lose jobs that carry no
-    value for the new facet (e.g. a city), so the merged result is checked against it and flagged capped
-    when it falls more than FETCH_TOLERANCE_PCT short.
+    rep gets "reported" (page-1 total of the root query), "expected" (the board size, only when split),
+    "capped" (the root itself is capped and no facet can split it), "capped_slices" (a child slice like
+    that: _recover decides whether it leaves a gap), "failed" (a node's page 1 failed), "over_budget".
+    `base` = filters applied to the whole board (the Accenture US filter).
     """
-    postings, total, facets = first
-    if total < WORKDAY_FACET_SPLIT_AT:
-        return postings
-    name, values = _pick_split_facet(facets, used)
-    if not name:
-        logger.warning("workday fetch: %r reports %d jobs (cap %d) and cannot be split further "
-                       "(applied=%s) — result is incomplete", company, total, WORKDAY_RESULT_CAP, applied)
-        if rep is not None and total >= WORKDAY_RESULT_CAP:
+    base = dict(base or {})
+    leaves, nodes = [], []
+    work = [(base, None, tuple(base), 0)]
+    try:
+        while work:
+            applied, size, used, depth = work.pop()
+            data = _page1(url, applied, company, rep)
+            if data is None:
+                rep["failed"] = True
+                if rep.get("blocked"):
+                    logger.warning("workday plan: Cloudflare challenge for %r — planning stopped", company)
+                    break
+                logger.warning("workday plan: page 1 failed for %r applied=%s — slice skipped", company, applied)
+                continue
+            total = data.get("total", 0) or 0
+            first = data.get("jobPostings") or []
+            if depth == 0:
+                rep["reported"] = total   # recorded before the retry below, which may skip the board
+            if total > 0 and not first:
+                # an empty page 1 must not decide flat vs split: ask once more
+                _budget_add(rep, 1)
+                again = _post(url, applied, 0, company, rep)
+                if again and again.get("jobPostings"):
+                    data = again
+                    rep["node_page1"][json.dumps(applied, sort_keys=True)] = again
+                    total = data.get("total", 0) or total
+                    first = data["jobPostings"]
+                elif total >= WORKDAY_RESULT_CAP:
+                    rep["failed"] = True
+                    logger.warning("workday plan: page 1 empty for %r applied=%s (total=%d) — slice skipped",
+                                   company, applied, total)
+                    continue
+            if depth == 0:
+                rep["reported"] = total
+            capped = False
+            if total >= WORKDAY_RESULT_CAP and first:
+                if rep.get("capped_board") is None:
+                    _budget_add(rep, 1)
+                    rep["logical"] = rep.get("logical", 0) + 1   # the probe is one request
+                capped = _board_is_capped(url, applied, first, rep, company)
+            if not capped:
+                leaves.append(_make_leaf(rep, applied, total, first, split=depth > 0))
+                continue
+            cands = _facet_candidates(data.get("facets"), used)
+            if size is None:
+                size = max(_board_size(cands) or 0, total)
+                rep["expected"] = size
+            best = _choose_facet(cands, size) if depth < WORKDAY_PLAN_MAX_DEPTH else None
+            if best is None:
+                keep = min(WORKDAY_RESULT_CAP, total)
+                leaves.append(_make_leaf(rep, applied, keep, first))
+                if depth:
+                    # its parent node covers it: _recover sets "capped" if the node stays short
+                    rep.setdefault("capped_slices", []).append((applied, size))
+                else:
+                    rep["capped"] = True   # nothing above the root can check coverage
+                (logger.info if depth else logger.warning)(
+                    "workday plan: %r slice %s has %d jobs and no usable facet — first %d only",
+                    company, applied, size, keep)
+                continue
+            name, values, covered = best
+            # K is the coverage floor _recover checks: the facet estimate, or the node's own higher total
+            nodes.append({"applied": dict(applied), "K": max(size, total), "facet": name, "depth": depth,
+                          "sum": covered, "used": used})
+            logger.info("workday plan: %r depth=%d size=%d split by %s (%d values, sum=%d)",
+                        company, depth, size, name, len(values), covered)
+            for v in values:
+                child = {**applied, name: [v["id"]]}
+                if v["count"] < WORKDAY_RESULT_CAP:
+                    leaves.append(_make_leaf(rep, child, v["count"], split=True))
+                else:
+                    work.append((child, v["count"], used + (name,), depth + 1))
+    except _OverBudget as e:
+        rep["failed"] = True
+        logger.warning("workday plan: request budget used up while planning (%s) — partial result", e)
+    return leaves, nodes
+
+
+def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
+    """
+    Page one leaf sequentially. Returns {job_key: posting}. The early-exit gate (fresh per leaf) sees
+    every non-final page that adds a job to this leaf (a replayed page cannot confirm the exit); True ends
+    the leaf and sets rep["early"]. Pages that failed or came back short are requested once more; a leaf that still does not match its promised count is recorded in
+    rep["leaf_mismatch"].
+
+    A leaf marked "grows" (the flat board, or a slice of a split board) takes a higher total reported by
+    any of its pages: the new count becomes its promise, and the extra offsets are paged on the request
+    budget already set. The flat board's new count is also rep["reported"]; a slice's rise is recorded in
+    rep["grown_leaves"] (applied, rise), which _recover adds to the nodes holding the slice. Paging past
+    WORKDAY_RESULT_CAP needs a tenant probed as uncapped: growth that reaches the cap on an unprobed
+    tenant probes it (once, one budgeted request). If the probe says capped, fails, or cannot be sent,
+    paging stops at the cap. On the flat board that sets rep["capped"]. A slice records its whole rise,
+    rows past the cap included, and _recover decides whether a node holding it is short; only a slice
+    whose highest total is exactly the cap sets rep["capped"], as its real count is unknown (a capped
+    tenant reports the cap for anything larger). A total of 0 (later pages often report none) or a lower
+    one does not change the paging. A slice paged without early exit whose every reported total is below
+    its promise has shrunk: the drop is recorded in rep["shrunk_leaves"] (applied, drop), which offsets
+    the rises of the leaves beside it (_node_target).
+    """
+    got = {}
+    leaf_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
+
+    def take(jobs, final):
+        # novel = the page brings a job this leaf has not delivered (other leaves do not count)
+        novel = any(_job_key(p) not in got for p in jobs)
+        for p in jobs:
+            _merge_row(got, _job_key(p), p)
+        if leaf_gate is None or norm is None:
+            return False
+        seen = [j for j in map(norm, jobs) if j]
+        if final or not novel or len(seen) != len(jobs):
+            # not a page the gate may stop on (last, short, retried, replayed or with titleless
+            # rows), but an unseen job on it still breaks the streak
+            if hasattr(leaf_gate, "reset_if_unseen"):
+                leaf_gate.reset_if_unseen(seen)
+            return False
+        if leaf_gate(seen):
+            rep["early"] = True
+            return True
+        return False
+
+    offs = list(leaf["offs"])
+    size = leaf["K"]   # the promised count: how far the leaf is paged
+    highest = size     # the highest count promised or reported (past `size` when the cap clips the paging)
+    first = leaf["first"]
+    asked = 0   # offsets of `offs` already requested
+    probed = False   # the cap probe is sent at most once per leaf
+    page1 = first    # page 1's rows, what a cap probe compares against: the cached page, else offset 0's
+    said = 0   # the highest total any response of this leaf reported
+
+    def follow(data, off):
+        """Raise the promise to the higher total of the response at `off`, adding the offsets it now needs."""
+        nonlocal size, highest, probed, page1, said
+        if off == 0 and not page1:
+            page1 = (data or {}).get("jobPostings")   # kept now: a later page may be the one reporting growth
+        total = (data or {}).get("total") or 0
+        said = max(said, total)
+        if not leaf.get("grows") or total <= size:
+            return
+        if not leaf.get("split"):   # a slice's total is not the board's
+            # the highest total seen: a capped board may answer a later page with a lower one
+            rep["reported"] = max(rep.get("reported") or 0, total)
+        if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is None and not probed:
+            # reaching the cap does not make a board capped: ask it, comparing against page 1's rows
+            if page1 and not rep.get("blocked") and rep.get("logical", 0) < rep.get("budget", 0.0):
+                probed = True
+                _budget_add(rep, 1)
+                rep["logical"] = rep.get("logical", 0) + 1   # the probe is one request
+                _board_is_capped(url, leaf["applied"], page1, rep, company)   # caches rep["capped_board"]
+        if leaf.get("split") and total > highest:   # a rise already recorded is not added again
+            rep.setdefault("grown_leaves", []).append((leaf["applied"], total - highest))
+            highest = total
+        if total >= WORKDAY_RESULT_CAP and rep.get("capped_board") is not False:
+            if not leaf.get("split"):
+                rep["capped"] = True   # no node above the flat board can check coverage
+            total = max(size, WORKDAY_RESULT_CAP)   # offsets past the cap may repeat page 1: page up to it only
+        size = total
+        offs.extend(range(offs[-1] + WORKDAY_PAGE_SIZE, size, WORKDAY_PAGE_SIZE))
+
+    # a cached page 1 shorter than it should be is not shown to the gate
+    stopped = bool(first) and take(first, final=(not offs) or _distinct(first) < min(WORKDAY_PAGE_SIZE, size))
+    try:
+        for i, off in enumerate(offs):   # follow() may append to `offs` while it is walked
+            if stopped or rep.get("blocked"):
+                break
+            asked = i + 1
+            data = _post(url, leaf["applied"], off, company, rep)
+            follow(data, off)
+            expect = min(WORKDAY_PAGE_SIZE, size - off)   # the last page is legitimately short
+            jobs = list(data.get("jobPostings") or []) if data else []
+            retried = False
+            if not data and rep.get("challenge"):
+                # Cloudflare challenge: the same request can never pass, so no retry and no further request
+                # for this scan (rep["blocked"]); keep what was fetched
+                logger.warning("workday fetch: Cloudflare challenge at offset=%d for %r applied=%s — scan stopped, partial result",
+                               off, company, leaf["applied"])
+                break
+            # distinct rows, on every page: a repeated row hides a missing one
+            if not data or _distinct(jobs) < expect:
+                # retried here, before the gate sees the page: a short page must not look "all seen"
+                retried = True
+                _budget_add(rep, 1)
+                again = _post(url, leaf["applied"], off, company, rep)
+                follow(again, off)
+                if again:
+                    pos = {_job_key(p): n for n, p in enumerate(jobs)}
+                    for p in again.get("jobPostings") or []:
+                        k = _job_key(p)
+                        if k not in pos:
+                            pos[k] = len(jobs)
+                            jobs.append(p)
+                        elif p.get("title") and not jobs[pos[k]].get("title"):
+                            jobs[pos[k]] = p   # a titled copy replaces a titleless one
+                elif not data:
+                    rep["failed"] = True
+                    logger.warning("workday fetch: request failed at offset=%d for %r applied=%s — partial result",
+                                   off, company, leaf["applied"])
+                    continue
+            final = i == len(offs) - 1   # judged after this page's responses: they may have added offsets
+            # a page that needed a retry (two responses merged) or is still short keeps its rows but is not gated
+            if take(jobs, final or _distinct(jobs) < expect or retried):
+                stopped = True
+                break
+    except _OverBudget as e:
+        e.got = got          # rows already fetched survive the hard stop
+        raise
+    if stopped:
+        # only the pages never requested count as skipped on purpose; rows lost on a requested page
+        # (short, or repeating an earlier one) stay a gap
+        unrequested = sum(min(WORKDAY_PAGE_SIZE, size - o) for o in offs[asked:])
+        rep.setdefault("early_leaves", []).append((leaf["applied"], len(got) + unrequested, len(got)))
+    if not stopped and len(got) != size:
+        rep.setdefault("leaf_mismatch", []).append((leaf["applied"], size, len(got)))
+    # an early-exited leaf is left out: its skip credit already covers the rows it no longer holds
+    if leaf.get("split") and not stopped and 0 < said < leaf["K"] and len(got) < leaf["K"]:
+        rep.setdefault("shrunk_leaves", []).append((leaf["applied"], leaf["K"] - max(said, len(got))))
+    if leaf.get("split") and highest == WORKDAY_RESULT_CAP > leaf["K"] and rep.get("capped_board") is not False:
+        rep["capped"] = True   # grew to exactly the cap: how many lie past it is unknown, so no node can check
+    return got
+
+
+def _merge_row(merged, k, p):
+    """First row per key wins, except that a titled row replaces a titleless one."""
+    if k not in merged or (p.get("title") and not merged[k].get("title")):
+        merged[k] = p
+
+
+def _fetch_leaves(url, leaves, company, rep, gate=None, norm=None):
+    """Fetch the leaves one after another. Returns (merged {job_key: posting}, [(applied, {keys})])."""
+    merged, leaf_got = {}, []
+
+    def keep(leaf, got):
+        for k, p in got.items():
+            _merge_row(merged, k, p)
+        leaf_got.append((leaf["applied"], set(got)))
+
+    def planned(leaf):
+        """The page 1 rows fetched while planning: kept, without a request, when no more can be sent."""
+        got = {}
+        for p in leaf["first"]:
+            _merge_row(got, _job_key(p), p)
+        return got
+
+    done = 0
+    try:
+        for leaf in leaves:
+            # after a Cloudflare challenge no more requests are sent
+            keep(leaf, planned(leaf) if rep.get("blocked") else _fetch_leaf(url, leaf, company, rep, gate, norm))
+            done += 1
+    except _OverBudget as e:
+        rep["failed"] = True
+        keep(leaves[done], getattr(e, "got", None) or {})
+        for leaf in leaves[done + 1:]:
+            keep(leaf, planned(leaf))
+        logger.warning("workday fetch: request budget used up (%s) — partial result", e)
+    return merged, leaf_got
+
+
+def _keep_node_page1(nodes, merged, leaf_got, rep):
+    """A split node's own page 1 (already fetched while planning) holds real jobs, some of which may carry
+    no value for the split facet and so appear in no leaf. Keep them and count them toward the node.
+    The cap probe's page (rep["probe_rows"]) is kept the same way, under the filters it was asked with."""
+    cache = rep.get("node_page1") or {}
+    pages = [(node["applied"], (cache.get(json.dumps(node["applied"], sort_keys=True)) or {}).get("jobPostings") or [])
+             for node in nodes]
+    for applied, page in pages + (rep.get("probe_rows") or []):
+        keys = set()
+        for p in page:
+            k = _job_key(p)
+            _merge_row(merged, k, p)
+            keys.add(k)
+        if keys:
+            leaf_got.append((dict(applied), keys))
+
+
+def _node_union(applied, leaf_got, merged):
+    """Keys of every fetched leaf that lies inside the node `applied` (its filters are a subset of the leaf's).
+    Titleless rows are left out: they are dropped from the result, so they close no gap."""
+    union = set()
+    for leaf_applied, keys in leaf_got:
+        if all(leaf_applied.get(a) == b for a, b in applied.items()):
+            union |= keys
+    return {k for k in union if (merged.get(k) or {}).get("title")}
+
+
+def _node_target(node, rep):
+    """A split node's coverage target: its promised count, raised by the net change of the leaves inside
+    it (rises in rep["grown_leaves"] less drops in rep["shrunk_leaves"], so jobs that only moved between
+    slices raise nothing). Never below the promise: a node that is short stays short."""
+    def net(key):
+        return sum(n for e, n in rep.get(key) or []
+                   if all(e.get(a) == b for a, b in node["applied"].items()))
+    return node["K"] + max(0, net("grown_leaves") - net("shrunk_leaves"))
+
+
+def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
+    """
+    Last recovery step for a node still short: searchText terms taken from the titles of jobs already
+    found inside this node, each searched inside the node. New jobs join `merged` and the node's union.
+    A term stops when a chunk adds under WORKDAY_SEARCH_MIN_NEW new jobs; the node stops after
+    WORKDAY_SEARCH_IDLE_TERMS terms in a row add nothing. Sequential, budgeted.
+    """
+    applied, size = node["applied"], node["K"]
+    have = _node_union(applied, leaf_got, merged)
+    tried, idle = set(), 0
+    # a search may spend what the facet would have cost to miss these jobs, no more
+    allowance = WORKDAY_GAP_PENALTY * (size - len(have)) / WORKDAY_PAGE_SIZE
+    spent = 0
+    have0 = len(have)
+
+    def gap(pending=0):
+        # same rule as _recover: rows an early-exited leaf skipped on purpose are credited only while unseen
+        found = len(have) + pending
+        return size - found - max(0, skipped - (found - have0))
+
+    def retry():
+        """One retry of a search request, only while the node's allowance and the scan budget both cover it."""
+        nonlocal spent
+        if allowance - spent < 1 or not _charge_retry(rep):
+            return False
+        spent += 1
+        return True
+
+    while not rep.get("blocked") and gap() > tol and idle < WORKDAY_SEARCH_IDLE_TERMS and allowance - spent >= 1:
+        words = collections.Counter()
+        for k in have:
+            title = (merged[k].get("title") or "").lower()
+            for w in set(re.findall(r"[a-z]{%d,}" % WORKDAY_SEARCH_TERM_MIN_LEN, title)):
+                if w not in WORKDAY_SEARCH_STOPWORDS and w not in tried:
+                    words[w] += 1
+        if not words:
+            break
+        term = words.most_common(1)[0][0]
+        tried.add(term)
+        new, off, ended = {}, 0, False
+        seen = set()   # every key this term returned: all lie inside the node, titled yet or not
+        try:
+            while off < WORKDAY_RESULT_CAP and not ended and allowance - spent >= 1 and gap(len(new)) > tol:
+                chunk = min(WORKDAY_SEARCH_CHUNK_PAGES, int(allowance - spent))   # never past the allowance
+                _budget_add(rep, chunk)
+                rows = fresh = 0
+                end = min(off + chunk * WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP)
+                for o in range(off, end, WORKDAY_PAGE_SIZE):
+                    if allowance - spent < 1:   # retries used up what was left of the chunk
+                        break
+                    spent += 1   # only requests actually sent are charged (retry() adds its own)
+                    data = _post(url, applied, o, company, rep, text=term, before_retry=retry)
+                    if data is None and not rep.get("blocked"):   # a failed request is not an empty result
+                        rep["failed"] = True
+                        logger.warning("workday search: request failed at offset=%d for %r term=%r applied=%s — partial result",
+                                       o, company, term, applied)
+                    jobs = (data or {}).get("jobPostings") or []
+                    if not jobs:
+                        ended = True
+                        break
+                    for p in jobs:
+                        rows += 1
+                        k = _job_key(p)
+                        seen.add(k)
+                        if not p.get("title"):
+                            # kept so a later titled copy can replace it; a copy already titled counts
+                            p = merged.setdefault(k, p)
+                        if p.get("title") and k not in have and k not in new:
+                            new[k] = p
+                            fresh += 1
+                    if gap(len(new)) <= tol:
+                        break
+                off = end
+                if rows == 0 or fresh / rows < WORKDAY_SEARCH_MIN_NEW:
+                    break
+        finally:   # rows already found survive a budget stop
+            have |= set(new)
+            for k, p in new.items():
+                _merge_row(merged, k, p)
+            if seen:
+                leaf_got.append((dict(applied), seen))
+        idle = 0 if new else idle + 1
+        logger.info("workday search: %r term=%r new=%d unique_now=%d gap=%d applied=%s",
+                    company, term, len(new), len(have), size - len(have), applied)
+
+
+def _recover(url, nodes, merged, leaf_got, company, rep):
+    """
+    Close gaps between a split node's promised count and the unique jobs its leaves returned, deepest
+    node first: within tolerance = done; else a direct window (the node's first WORKDAY_RESULT_CAP jobs,
+    only for nodes up to WORKDAY_WINDOW_MAX x the cap); else searchText. A node still short is recorded
+    in rep["partial"] and sets rep["capped"]; that is judged after the last node, because a parent's rows
+    can give a title to a child's titleless one. What an early-exited leaf inside the node skipped on purpose
+    (rep["early_leaves"]: applied, K, got) is not counted as a gap; short sibling leaves still are. Leaves
+    that grew by more than their siblings shrank raise the node's count (_node_target), so their extra rows
+    cannot stand in for rows a sibling lost.
+    """
+    early = rep.get("early_leaves") or []
+    short = []   # (applied, size, tolerance, skip credit) of nodes short when their turn ended
+    try:
+        for node in sorted(nodes, key=lambda n: -n["depth"]):
+            applied = node["applied"]
+            size = _node_target(node, rep)
+            # jobs an early-exited leaf inside this node skipped on purpose: not a gap
+            skipped = sum(max(0, k - got) for e, k, got in early
+                          if all(e.get(a) == b for a, b in applied.items()))
+            have = len(_node_union(applied, leaf_got, merged))
+            have0 = have
+            tol = max(WORKDAY_GAP_MIN, WORKDAY_GAP_TOL * size)
+            if size - have - skipped <= tol:
+                continue
+            if size <= WORKDAY_WINDOW_MAX * WORKDAY_RESULT_CAP:
+                page1 = (rep.get("node_page1") or {}).get(json.dumps(applied, sort_keys=True)) or {}
+                window = _make_leaf(rep, dict(applied), min(size, WORKDAY_RESULT_CAP), page1.get("jobPostings"))
+                try:
+                    got = _fetch_leaf(url, window, company, rep)   # never gated
+                except _OverBudget as e:
+                    for k, p in (getattr(e, "got", None) or {}).items():
+                        _merge_row(merged, k, p)   # rows fetched before the budget stop are kept
+                    raise
+                for k, p in got.items():
+                    _merge_row(merged, k, p)
+                leaf_got.append((dict(applied), set(got)))
+                after = len(_node_union(applied, leaf_got, merged))
+                logger.info("workday window: %r size=%d unique %d -> %d applied=%s", company, size, have, after, applied)
+                have = after
+            # rows the window found may be the very rows the early leaf skipped: credit only what is still unseen
+            skipped0 = skipped
+            skipped = max(0, skipped0 - (have - have0))
+            if size - have - skipped > tol:
+                _search_node(url, dict(node, K=size), merged, leaf_got, tol, company, rep, skipped)
+                have = len(_node_union(applied, leaf_got, merged))
+                skipped = max(0, skipped0 - (have - have0))
+            if size - have - skipped > tol:
+                short.append((applied, size, tol, skipped))
+    except _OverBudget as e:
+        rep["failed"] = True
+        logger.warning("workday recover: request budget used up (%s) — partial result", e)
+    for applied, size, tol, skipped in short:
+        have = len(_node_union(applied, leaf_got, merged))   # titles gained since the node's turn count
+        if size - have - skipped > tol:
+            rep.setdefault("partial", []).append((applied, size, have))
             rep["capped"] = True
-        return _fetch_pages(url, applied, company, rep=rep)[0]   # first was deferred after page 1: page it in full
-    merged = {}
-    for value in values:
-        slice_applied = {**applied, name: [value["id"]]}
-        # Each facet slice is its own list with its own order: it gets a fresh gate (streak 0).
-        slice_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
-        for p in _collect(url, slice_applied, used + (name,),
-                          _fetch_pages(url, slice_applied, company, defer_large=True, rep=rep,
-                                       gate=slice_gate, norm=norm),
-                          company, rep, value.get("count"), gate=slice_gate, norm=norm):
-            merged.setdefault(_job_key(p), p)
-    early = bool(rep and rep.get("early"))
-    if slice_count and not early and len(merged) < slice_count * (1 - FETCH_TOLERANCE_PCT / 100):
-        # WW: a nested split routinely misses jobs lacking the new facet (e.g. a city); that is
-        # expected, and the board-level result is still flagged capped below. WARNING only at top level.
-        (logger.info if used else logger.warning)(
-            "workday fetch: %r slice %s reports %d jobs but split by %s fetched %d distinct "
-            "— some jobs carry no %s value", company, applied, slice_count, name, len(merged), name)
-        if rep is not None:
-            rep["capped"] = True
-    expected = sum(v.get("count", 0) for v in values)
-    if rep is not None and not used:
-        rep["expected"] = expected
-    if early:
-        logger.info("workday fetch: %r split by %s early exit, %d distinct jobs read", company, name, len(merged))
-    elif len(merged) < expected:
-        (logger.info if used else logger.warning)(   # WW: nested shortfall is covered by the slice check above
-            "workday fetch: %r split by %s fetched %d distinct of %d expected (applied=%s)",
-            company, name, len(merged), expected, applied)
-    else:
-        logger.info("workday fetch: %r split by %s into %d slices, %d distinct jobs",
-                    company, name, len(values), len(merged))
-    return list(merged.values())
+            logger.warning("workday recover: %r node %s still short after window+search: %d of %d",
+                           company, applied, have, size)
 
 
 def fetch_job_detail(job):
@@ -333,25 +960,16 @@ def fetch_job_detail(job):
         Updated job dict with description filled.
     """
     slug          = job.get("_slug", "")
-    wd            = job.get("_wd", "")
+    wd            = job.get("_wd")          # None = missing; "" = bare host (valid)
     path          = job.get("_path", "")
     external_path = job.get("_external_path", "")
     site          = job.get("_site")
 
-    if not all([slug, wd, path, external_path]):
+    if not all([slug, path, external_path]) or not wd_present(wd, site):
         return job
 
     # Build URL based on which Workday domain variant is used
-    if site == "myworkdaysite":
-        url = (
-            f"https://{wd}.myworkdaysite.com"
-            f"/wday/cxs/{slug}/{path}{external_path}"
-        )
-    else:
-        url = (
-            f"https://{slug}.{wd}.myworkdayjobs.com"
-            f"/wday/cxs/{slug}/{path}{external_path}"
-        )
+    url = f"{workday_domain(slug, wd, site)}/wday/cxs/{slug}/{path}{external_path}"
 
     data = fetch_json(url, platform="workday", headers=WORKDAY_HEADERS)
     if not data:
@@ -505,6 +1123,44 @@ def _parse_additional_location(loc):
     return loc
 
 
+def _job_req_id(job, external_path, job_url):
+    """
+    Requisition id of a listing (design P1). bulletFields[0] is the id on most tenants but not on Motorola
+    (location), Intel ("Spotlight Job") or Wisconsin (no id bullet), where many jobs then share one id.
+    The id is the text after the last "_" of the last externalPath segment. Use the bullet equal to it, or
+    to it minus a trailing "-<digits>" (Intel JR0289044-1 -> JR0289044); else the token itself when it is
+    shaped like an id (Wisconsin); else (a word such as "..._Engineer") the first id-shaped bullet.
+    Without a usable path token: bulletFields[0] if it is shaped like an id (no spaces, has a digit);
+    else the posting id in the URL's last path segment (all digits, or "_R-...").
+    With no requisition id at all, the posting's own path (externalPath, else its posting URL's key), so
+    postings sharing a word or a text bullet stay apart. Not "": the scan workers drop a job without a
+    job_id. "" only when the posting has no path of its own either.
+    """
+    bullets = [b for b in (job.get("bulletFields") or []) if isinstance(b, str)]
+    segment = (external_path or "").rstrip("/").rsplit("/", 1)[-1]
+    # only a posting path ("/job/...") carries a requisition token; a site/landing path does not
+    token = segment.rsplit("_", 1)[-1].strip() if "_" in segment and "/job/" in (external_path or "") else ""
+    if token:
+        base = re.sub(r"-\d+$", "", token)
+        for cand in (token, base):
+            if cand in bullets:
+                return cand
+        if _is_req_id(token):
+            return token
+        return next((b for b in bullets if _is_req_id(b)), external_path)
+    first = bullets[0] if bullets else ""
+    if _is_req_id(first):
+        return first
+    try:
+        last = urlparse(job_url).path.rstrip("/").rsplit("/", 1)[-1]
+    except ValueError:   # malformed URL: no posting id to read from its path
+        last = ""
+    if last.isdigit():
+        return last
+    m = re.search(r"_((?:JR|R)-?\d+(?:-\d+)?)", last)
+    return m.group(1) if m else external_path or _own_url_key(job_url)
+
+
 def _normalize(job, company, domain, path, slug_info=None):
     """
     Normalize Workday job to standard format.
@@ -554,36 +1210,55 @@ def _normalize(job, company, domain, path, slug_info=None):
     # the careers homepage), derive external_path from it so fetch_job_detail()
     # can build the CXS detail endpoint.  This handles tenants that omit the
     # relative-path field but return an absolute job URL.
+    _si = slug_info or {}
+    _is_site = _si.get("site") == "myworkdaysite"
     if not external_path and external_url and external_url.startswith("http"):
-        from urllib.parse import urlparse as _urlparse
-        _parsed_path = _urlparse(external_url).path  # e.g. "/en-US/NVIDIAExternalCareerSite/job/Loc/Title_R-1"
-        _path_prefix = "/" + path.strip("/")          # e.g. "/NVIDIAExternalCareerSite"
-        # Use find so locale-prefixed URLs (e.g. /en-US/NVIDIAExternalCareerSite/...)
-        # are handled the same as unprefixed ones (/NVIDIAExternalCareerSite/...).
-        _path_idx = _parsed_path.find(_path_prefix + "/")
-        if _path_idx != -1:
-            external_path = _parsed_path[_path_idx + len(_path_prefix):]  # e.g. "/job/Loc/Title_R-1"
+        try:
+            # e.g. "/en-US/NVIDIAExternalCareerSite/job/Loc/Title_R-1"
+            _parsed_path = urlparse(external_url).path
+        except ValueError:   # malformed URL (e.g. "http://[..."): treated as no URL at all
+            external_url = _parsed_path = ""
+        if _is_site:   # drop "/recruiting/{tenant}" first: a site named like the tenant must not match it
+            _parsed_path = re.sub(r"^.*?/recruiting/[^/]+", "", _parsed_path)
+        # Search every position so locale-prefixed URLs (e.g. /en-US/NVIDIAExternalCareerSite/...)
+        # are handled the same as unprefixed ones. The site is compared segment by segment with
+        # unreserved escapes decoded ("%45xternal" is "External"); the rest is kept as written.
+        _segments = _parsed_path.split("/")
+        _site = [decode_unreserved(s) for s in path.strip("/").split("/")]
+        for i in range(1, len(_segments) - len(_site)):   # something must follow the site
+            if [decode_unreserved(s) for s in _segments[i:i + len(_site)]] == _site:
+                external_path = "/" + "/".join(_segments[i + len(_site):])  # e.g. "/job/Loc/Title_R-1"
+                break
+
+    # public career site root; myworkdaysite pages live under /recruiting/{tenant}/ (the CXS API does not)
+    site_root = domain.rstrip("/")
+    if _is_site:
+        site_root += "/recruiting/" + _si.get("slug", "")
+    site_root += "/" + path.strip("/")
 
     if external_path:
-        # Relative path from real Workday API — prepend domain + career site name
-        job_url = domain.rstrip("/") + "/" + path.strip("/") + "/" + external_path.lstrip("/")
+        # Relative path from real Workday API — prepend the career site root
+        job_url = site_root + "/" + external_path.lstrip("/")
     elif external_url and external_url.startswith("http"):
         # Absolute URL provided directly (legacy/test data)
         job_url = external_url
     else:
-        # Neither field present — build a best-effort fallback from domain + path
+        # Neither field present — fall back to the career site root
         # so we never silently drop a job with a valid title
-        job_url = domain.rstrip("/") + "/" + path.strip("/")
+        job_url = site_root
 
-    # bulletFields[0] is the job req ID (e.g. "R-107385") — confirmed across tenants.
-    # Fall back to regex on job_url for safety.
-    import re as _re
-    _bullet_id = (job.get("bulletFields") or [""])[0]
-    if not _bullet_id:
-        _wd_match  = _re.search(r'_((?:JR|R)-?\d+(?:-\d+)?)', job_url)
-        _bullet_id = _wd_match.group(1) if _wd_match else ""
+    if not (job.get("externalPath") or "").strip() and not _own_url_key(job_url):
+        # A careers URL (or the root) that postings share. job_postings.job_url is unique and distinct
+        # counts fall back to it, so the posting's identity goes into the fragment: the link still opens
+        # the same page. The workers drop a job without a job_id: it is a requisition-shaped bullet, else
+        # that same identity (a text label is shared too).
+        tag = "wd-" + hashlib.sha1(_job_key(job).encode("utf-8", "replace")).hexdigest()[:16]
+        bullets = job.get("bulletFields") or []
+        _bullet_id = bullets[0] if bullets and _is_req_id(bullets[0]) else tag
+        job_url += ("&" if "#" in job_url else "#") + tag
+    else:
+        _bullet_id = _job_req_id(job, external_path, job_url)
 
-    _si = slug_info or {}
     return {
         "company":        company,
         "title":          job.get("title", ""),
@@ -596,7 +1271,7 @@ def _normalize(job, company, domain, path, slug_info=None):
         # Detail-fetch fields — used by fetch_job_detail(), not stored in DB
         "_external_path": external_path,
         "_slug":          _si.get("slug", ""),
-        "_wd":            _si.get("wd", ""),
+        "_wd":            _si.get("wd"),   # "" = bare host (valid); None = key missing
         "_path":          path,
         "_site":          _si.get("site"),
     }

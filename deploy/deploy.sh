@@ -18,6 +18,23 @@ set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$DEPLOY_DIR")"
+
+# ── Sanity: must NOT be root (checked before any file is created, so root leaves no root-owned artifacts) ──
+if [[ $EUID -eq 0 ]]; then
+    echo "[ERROR] Do NOT run deploy.sh as root / sudo."
+    echo "        Run as the service user (opc): bash deploy/deploy.sh"
+    exit 1
+fi
+
+# One deploy at a time: concurrent runs would race on the pull, setup_cron.sh, the wrapper
+# regeneration and the data/.cron_regen_pending flag. The lock is held until this shell exits.
+mkdir -p "$PROJECT_DIR/data"
+exec 9>"$PROJECT_DIR/data/.deploy.lock"
+if ! flock -n 9; then
+    echo "[ERROR] Another deploy is already running (lock: $PROJECT_DIR/data/.deploy.lock) — aborting."
+    exit 1
+fi
+
 SKIP_HEALTH=false
 NO_RESTART=false
 
@@ -33,13 +50,6 @@ echo "  Mail Pipeline — code deployment"
 echo "  Project : $PROJECT_DIR"
 echo "  Time    : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "════════════════════════════════════════════════════════════"
-
-# ── Sanity: must NOT be root ──────────────────────────────────────────────────
-if [[ $EUID -eq 0 ]]; then
-    echo "[ERROR] Do NOT run deploy.sh as root / sudo."
-    echo "        Run as the service user (opc): bash deploy/deploy.sh"
-    exit 1
-fi
 
 # ── Pull latest code ──────────────────────────────────────────────────────────
 echo ""
@@ -58,9 +68,79 @@ fi
 # Capture the current SHA before any update so we can roll back if needed.
 PREVIOUS_SHA=$(git rev-parse HEAD)
 
+# ── The user's own crontab lines ──────────────────────────────────────────────
+# Rollback runs PREVIOUS_SHA's setup_cron.sh, and an older one strips every run_*.sh entry, the
+# user's own included. These two helpers carry the lines the pipeline does not own across that run.
+# Their filters are those of setup_cron.sh's merge: keep them in step.
+_user_cron_lines() {   # $1 = crontab text
+    local lines="$1"
+    if grep -qF '# === BEGIN RECRUITER PIPELINE ===' <<<"$lines"; then
+        # unmatched BEGIN: setup_cron.sh aborts without writing, so there is nothing to carry over
+        grep -qF '# === END RECRUITER PIPELINE ===' <<<"$lines" || return 0
+        lines=$(sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d' <<<"$lines")
+    fi
+    { grep -Ev '/home/opc/mail/run_(sync|nightly|monday|monthly|outreach|monitor|detect|weekly_summary|enrich|renew_watch|verify_filled|sync_dol_lca)\.sh([[:space:]]|$|[;&|<>)"'"'"'])' <<<"$lines" \
+        | grep -v 'scripts/log_monitor\.py' \
+        | grep -v 'hashlib.*range(100000)' \
+        | sed '/^[[:space:]]*$/d'; } || true   # grep exits 1 when no line is left
+}
+
+_restore_user_cron() {   # $1 = the user's lines, saved before the old setup_cron.sh ran
+    local saved="$1" current outside extra line path keep="" merged missing=false conflict=false
+    local stripped='/home/opc/mail/run_[a-z_]*\.sh'   # all an old setup_cron.sh takes from these lines
+    [[ -n "$saved" ]] || return 0
+    if current=$(crontab -l 2>/dev/null); then
+        # a line counts as present only outside the pipeline block
+        outside=$(sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d' <<<"$current")
+        extra=$(grep -vxF -e "$saved" <<<"$outside" || true)   # installed now, not in the backup
+        while IFS= read -r line; do
+            if ! grep -qxF -- "$line" <<<"$outside"; then
+                # any other missing line was removed or replaced by hand since the backup: it stays so
+                grep -q -- "$stripped" <<<"$line" || continue
+                # a line the backup does not have naming the same script: the missing one was edited
+                for path in $(grep -o -- "$stripped" <<<"$line"); do
+                    if grep -qF -- "$path" <<<"$extra"; then conflict=true; fi
+                done
+                missing=true
+            fi
+            keep+="$line"$'\n'
+        done <<<"$saved"
+        $missing || return 0
+        # the saved lines first, in their own order, then every other line installed now (the pipeline
+        # block included): nothing that is in the crontab is dropped
+        if ! $conflict; then
+            merged=$(SAVED="${keep%$'\n'}" awk '
+                BEGIN { n = split(ENVIRON["SAVED"], s, "\n"); for (i = 1; i <= n; i++) { print s[i]; have[s[i]]++ } }
+                /# === BEGIN RECRUITER PIPELINE ===/ { block = 1 }
+                !block && have[$0] > 0 { have[$0]--; next }
+                { print }
+                /# === END RECRUITER PIPELINE ===/ { block = 0 }
+            ' <<<"$current") && printf '%s\n' "$merged" | crontab - && return 0
+        fi
+    fi
+    echo "  [WARN] could not restore your own crontab lines (unreadable crontab, failed write, or a line"
+    echo "         edited since the backup) — check 'crontab -l', add back what you still need from these,"
+    echo "         then delete $_CRON_USER_BACKUP :"
+    printf '%s\n' "$saved"
+    return 1
+}
+
+_restore_saved_user_cron() {   # restores the lines backed up on disk; the backup goes only once they are back
+    [[ -f "$_CRON_USER_BACKUP" ]] || return 0
+    local saved
+    saved=$(cat "$_CRON_USER_BACKUP") || return 1
+    _restore_user_cron "$saved" || return 1
+    rm -f "$_CRON_USER_BACKUP"
+}
+
 # ── Shared rollback helper ────────────────────────────────────────────────────
 _rollback_to_previous() {
     echo "  [ROLLBACK] Reverting to $PREVIOUS_SHA..."
+    # wrappers regenerated in this deploy are pending again until they are restored below, so a
+    # rollback that fails or is interrupted leaves the flag for the next deploy
+    if ${_CRON_REGENERATED:-false}; then
+        touch "$_CRON_PENDING_FLAG" || echo "  [WARN] could not set $_CRON_PENDING_FLAG"
+    fi
     git reset --hard HEAD 2>/dev/null || true
     local _checkout_ok=true
     if ! git checkout -B "$_BRANCH" "$PREVIOUS_SHA"; then
@@ -74,6 +154,33 @@ _rollback_to_previous() {
             || echo "  [FATAL] pip rollback failed"
         sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
         sudo systemctl daemon-reload || true
+        # wrappers/crontab regenerated from the new setup_cron.sh must go back with the code
+        if ${_CRON_REGENERATED:-false}; then
+            local _user_cron _cron_now _setup_ok=true
+            # without a copy of the user's lines on disk the old setup_cron.sh must not run; the flag stays.
+            # A backup left by an earlier rollback is restored first, never overwritten.
+            if ! _restore_saved_user_cron; then
+                echo "  [WARN] an earlier crontab backup is not restored ($_CRON_USER_BACKUP) — cron wrappers not restored (the next deploy retries)"
+            elif ! _cron_now=$(crontab -l); then
+                echo "  [WARN] crontab -l failed — cron wrappers not restored; re-run setup_cron.sh manually (the next deploy retries)"
+            else
+                _user_cron=$(_user_cron_lines "$_cron_now")
+                if [[ -n "$_user_cron" ]] \
+                    && ! { printf '%s\n' "$_user_cron" > "$_CRON_USER_BACKUP.tmp" \
+                           && mv "$_CRON_USER_BACKUP.tmp" "$_CRON_USER_BACKUP"; }; then
+                    echo "  [WARN] could not save your crontab lines to $_CRON_USER_BACKUP — cron wrappers not restored (the next deploy retries)"
+                else
+                    if ! bash "$PROJECT_DIR/setup_cron.sh"; then
+                        _setup_ok=false
+                        echo "  [WARN] cron wrapper restore failed — re-run setup_cron.sh manually (the next deploy retries)"
+                    fi
+                    # the user's lines go back even when setup_cron.sh failed part-way
+                    if _restore_saved_user_cron && $_setup_ok; then
+                        rm -f "$_CRON_PENDING_FLAG"
+                    fi
+                fi
+            fi
+        fi
     else
         echo "  [WARN] Skipping pip install and unit sync — code state unknown"
     fi
@@ -127,6 +234,12 @@ _pull_err() {
     exit $_exit
 }
 
+_CRON_PENDING_FLAG="$PROJECT_DIR/data/.cron_regen_pending"
+_CRON_USER_BACKUP="$PROJECT_DIR/data/.cron_user_lines"   # present = a rollback did not put these back
+_CRON_REGENERATED=false
+if ! _restore_saved_user_cron; then
+    echo "  [WARN] crontab backup kept in $_CRON_USER_BACKUP — the next deploy retries"
+fi
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
@@ -141,7 +254,8 @@ echo "  Commits behind : $BEHIND"
 
 if [[ "$BEHIND" == "0" ]]; then
     echo "  Already up to date — skipping pull."
-    if $NO_RESTART; then
+    # a pending cron regeneration (flag file) must still run below, even with nothing to pull
+    if $NO_RESTART && [[ ! -f "$_CRON_PENDING_FLAG" ]]; then
         echo ""
         echo "════════════════════════════════════════════════════════════"
         echo "  Nothing to do."
@@ -149,7 +263,21 @@ if [[ "$BEHIND" == "0" ]]; then
         exit 0
     fi
 else
+    # The run_*.sh wrappers are generated from setup_cron.sh and are not in git, so a changed
+    # setup_cron.sh does not reach them on its own (the VM ran a stale run_monthly.sh for a week).
+    # Persisted in a flag file so a failed regeneration (or an aborted deploy) is retried by the next deploy,
+    # even when that one pulls nothing; cleared only after setup_cron.sh succeeds.
+    # Set BEFORE the pull and cleared only once the pulled commits are known to leave setup_cron.sh alone:
+    # the pull can bring commits pushed since the fetch above, and a deploy interrupted during or right
+    # after it would leave nothing to detect next time.
+    _cron_was_pending=false
+    if [[ -f "$_CRON_PENDING_FLAG" ]]; then _cron_was_pending=true; fi
+    mkdir -p "$PROJECT_DIR/data"
+    touch "$_CRON_PENDING_FLAG"
     git pull origin "${_BRANCH}"
+    if ! $_cron_was_pending && git diff --quiet "$PREVIOUS_SHA" HEAD -- setup_cron.sh; then
+        rm -f "$_CRON_PENDING_FLAG"
+    fi
     NEW_SHA=$(git rev-parse --short HEAD)
     echo "  Updated to : $NEW_SHA"
     echo ""
@@ -200,10 +328,17 @@ for _w in $_cron_wrappers; do
 done
 if [[ $_crontab_rc -ne 0 ]]; then
     :   # already warned above; deploy continues (self-heal is non-fatal)
-elif [[ -n "$_missing_wrappers" ]]; then
-    echo "  [WARN] Cron wrapper(s) missing or not executable:$_missing_wrappers"
-    echo "  [WARN] Something deleted them — regenerating via setup_cron.sh"
+elif [[ -n "$_missing_wrappers" ]] || [[ -f "$_CRON_PENDING_FLAG" ]]; then
+    if [[ -n "$_missing_wrappers" ]]; then
+        echo "  [WARN] Cron wrapper(s) missing or not executable:$_missing_wrappers"
+        echo "  [WARN] Something deleted them — regenerating via setup_cron.sh"
+    else
+        echo "  setup_cron.sh changed in this deploy — regenerating wrappers"
+    fi
+    # set before the call: a setup_cron.sh that fails part-way may already have replaced some wrappers
+    _CRON_REGENERATED=true   # a later rollback re-runs the old setup_cron.sh
     if bash "$PROJECT_DIR/setup_cron.sh"; then
+        rm -f "$_CRON_PENDING_FLAG"
         echo "  Cron wrappers regenerated."
     else
         echo "  [WARN] setup_cron.sh failed — cron jobs may not run; fix manually"

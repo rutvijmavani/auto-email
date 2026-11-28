@@ -56,8 +56,21 @@ echo "[OK] Log directory: $LOG_DIR"
 # WRAPPER SCRIPTS
 # ═══════════════════════════════════════════════════════════════
 
+# install_wrapper NAME < script — write to a temp file in the same directory, chmod, then rename over
+# the live wrapper (atomic: a cron run reading the old file never sees a half-written one; any
+# failure leaves the existing wrapper untouched).
+install_wrapper() {
+  local dest="$PROJECT_DIR/$1" tmp
+  tmp=$(mktemp "$PROJECT_DIR/.$1.XXXXXX") || return 1
+  if cat > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dest"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 # ── daytime sync (forms + prospective) ────────────────────────
-cat > "$PROJECT_DIR/run_sync.sh" << 'EOF'
+install_wrapper run_sync.sh << 'EOF'
 #!/bin/bash
 # run_sync.sh — daytime sync: --sync-forms + --sync-prospective
 # Safe standalone: read+insert only, no backup needed.
@@ -83,7 +96,7 @@ exit $EXIT_CODE
 EOF
 
 # ── nightly chain Tue-Sun (sync → backup → find-only → verify-filled) ─
-cat > "$PROJECT_DIR/run_nightly.sh" << 'EOF'
+install_wrapper run_nightly.sh << 'EOF'
 #!/bin/bash
 # run_nightly.sh — Tue-Sun 1 AM nightly chain:
 #   [pause workers] → sync → backup → find-only → verify-filled → [resume workers]
@@ -144,7 +157,7 @@ exit $EXIT_CODE
 EOF
 
 # ── monday nightly chain (sync → backup → verify → find-only → verify-filled) ─
-cat > "$PROJECT_DIR/run_monday.sh" << 'EOF'
+install_wrapper run_monday.sh << 'EOF'
 #!/bin/bash
 # run_monday.sh — Monday 1 AM nightly chain:
 #   [pause workers] → sync → backup → verify-only → find-only → verify-filled → [resume workers]
@@ -201,7 +214,7 @@ exit $EXIT_CODE
 EOF
 
 # ── monthly chain (1st of month) ───────────────────────────────
-cat > "$PROJECT_DIR/run_monthly.sh" << 'EOF'
+install_wrapper run_monthly.sh << 'EOF'
 #!/bin/bash
 # run_monthly.sh — 1st of every month at 1 AM
 # Fully sequential chain — replaces both nightly and monthly jobs:
@@ -271,7 +284,7 @@ exit $EXIT_CODE
 EOF
 
 # ── outreach (Mon-Fri 9 AM) ────────────────────────────────────
-cat > "$PROJECT_DIR/run_outreach.sh" << 'EOF'
+install_wrapper run_outreach.sh << 'EOF'
 #!/bin/bash
 # run_outreach.sh — Mon-Fri 9 AM: --outreach-only
 PROJECT_DIR="/home/opc/mail"
@@ -294,7 +307,7 @@ exit $EXIT_CODE
 EOF
 
 # ── monitor-jobs (daily 7 AM) ──────────────────────────────────
-cat > "$PROJECT_DIR/run_monitor.sh" << 'EOF'
+install_wrapper run_monitor.sh << 'EOF'
 #!/bin/bash
 # run_monitor.sh — Daily 7 AM: --monitor-jobs
 PROJECT_DIR="/home/opc/mail"
@@ -317,7 +330,7 @@ exit $EXIT_CODE
 EOF
 
 # ── detect-ats (currently disabled) ───────────────────────────
-cat > "$PROJECT_DIR/run_detect.sh" << 'EOF'
+install_wrapper run_detect.sh << 'EOF'
 #!/bin/bash
 # run_detect.sh — --detect-ats --batch (disabled — run manually)
 PROJECT_DIR="/home/opc/mail"
@@ -340,7 +353,7 @@ exit $EXIT_CODE
 EOF
 
 # ── weekly-summary (Mon 9 AM) ──────────────────────────────────
-cat > "$PROJECT_DIR/run_weekly_summary.sh" << 'EOF'
+install_wrapper run_weekly_summary.sh << 'EOF'
 #!/bin/bash
 # run_weekly_summary.sh — Mon 9 AM: --weekly-summary
 PROJECT_DIR="/home/opc/mail"
@@ -363,7 +376,7 @@ exit $EXIT_CODE
 EOF
 
 # ── daily enrichment (3 AM) ────────────────────────────────────
-cat > "$PROJECT_DIR/run_enrich.sh" << 'EOF'
+install_wrapper run_enrich.sh << 'EOF'
 #!/bin/bash
 # run_enrich.sh — Daily 3 AM: Phase B background enrichment
 # Runs independently — enrichment is read+write on ats_discovery.db only,
@@ -393,7 +406,7 @@ exit $EXIT_CODE
 EOF
 
 # ── DOL LCA sync (monthly, 1st of month 6 AM) ─────────────────
-cat > "$PROJECT_DIR/run_sync_dol_lca.sh" << 'EOF'
+install_wrapper run_sync_dol_lca.sh << 'EOF'
 #!/bin/bash
 # run_sync_dol_lca.sh — Monthly DOL LCA sync: scrape, download, ingest
 # Runs at 6 AM on the 1st of every month (5 hours after the 1 AM pipeline chain).
@@ -417,7 +430,7 @@ exit $EXIT_CODE
 EOF
 
 # ── Gmail watch renewal (daily 2 AM) ──────────────────────────
-cat > "$PROJECT_DIR/run_renew_watch.sh" << 'EOF'
+install_wrapper run_renew_watch.sh << 'EOF'
 #!/bin/bash
 # run_renew_watch.sh — Daily 2 AM: renew Gmail Pub/Sub watches expiring within 48h
 # Also catches up on any emails missed during a watch gap via history.list.
@@ -441,7 +454,7 @@ exit $EXIT_CODE
 EOF
 
 # ── verify-filled (manual use / standalone) ────────────────────
-cat > "$PROJECT_DIR/run_verify_filled.sh" << 'EOF'
+install_wrapper run_verify_filled.sh << 'EOF'
 #!/bin/bash
 # run_verify_filled.sh — --verify-filled
 # NOT in crontab — runs as part of nightly/monday/monthly chains.
@@ -634,7 +647,7 @@ elif echo "$EXISTING_NON_PIPELINE" | grep -qF "# === BEGIN RECRUITER PIPELINE ==
 fi
 # Strip legacy run_*.sh pipeline entries (pre-marker crontabs)
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
-    grep -v '/home/opc/mail/run_[a-z_]*\.sh' || true)
+    grep -Ev '/home/opc/mail/run_(sync|nightly|monday|monthly|outreach|monitor|detect|weekly_summary|enrich|renew_watch|verify_filled|sync_dol_lca)\.sh([[:space:]]|$|[;&|<>)"'"'"'])' || true)
 # Strip log_monitor and keep-alive entries (re-added inside the marker block)
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
     grep -v 'scripts/log_monitor\.py' || true)

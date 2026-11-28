@@ -15,10 +15,12 @@ Rules (agreed 2026-10-12):
   * A pasted job URL that matches no known pattern writes nothing.
 """
 import json
+from urllib.parse import urlparse, urlunsplit
 
 from config import DISCOVERY_REDETECT, ENRICHMENT_ON_DEMAND
 from db.connection import get_conn
-from jobs.ats.patterns import match_ats_pattern
+from jobs.ats import workday
+from jobs.ats.patterns import _decode_google_redirect, match_ats_pattern
 from jobs.ats.registry import ATS_REGISTRY, SLUG_REQUIRED_KEYS
 
 # Platforms that cannot be written from the Discover page.
@@ -56,8 +58,17 @@ def validate_platform_slug(platform: str, slug: str) -> "tuple[str | None, str |
         required = SLUG_REQUIRED_KEYS.get(platform, ())
         if not isinstance(obj, dict):
             return None, f"{platform} slug must be a JSON object."
-        missing = [k for k in required
-                   if not isinstance(obj.get(k), str) or not obj[k].strip()]
+        if platform == "workday":
+            # "wd" may be "" (bare host, nxp.myworkdayjobs.com): the key must exist and be a
+            # string; only myworkdaysite needs a non-empty value (workday.wd_present).
+            missing = [k for k in required if k != "wd"
+                       and (not isinstance(obj.get(k), str) or not obj[k].strip())]
+            wd = obj.get("wd")
+            if not isinstance(wd, str) or wd != wd.strip() or not workday.wd_present(wd, obj.get("site")):
+                missing.append("wd")
+        else:
+            missing = [k for k in required
+                       if not isinstance(obj.get(k), str) or not obj[k].strip()]
         if missing:
             # fetch_jobs silently returns [] (or raises) without these — a row saved like
             # that would look enabled but never scan.
@@ -72,7 +83,35 @@ def match_job_url(job_url: str) -> "tuple[dict | None, str | None]":
     url = (job_url or "").strip()
     if not url.startswith(("http://", "https://")):
         return None, "Paste a full URL starting with https://"
-    hit = match_ats_pattern(url)
+    hit = match_ats_pattern(url, own_url=True)   # an ATS link in the path/query never counts
+    if hit and hit["platform"] == "workday":
+        # The Workday regex scans free text, so a Workday host inside a path or query of some other
+        # site would match. A pasted URL must be on a Workday host itself; its query is ignored.
+        try:
+            # checked on the same URL that was matched: a Google "/url?q=" link stands for its target
+            # (the same shape from any other host matched nothing above)
+            parsed = urlparse(_decode_google_redirect(url))
+            host = (parsed.hostname or "").lower()
+        except ValueError:
+            host = ""
+        if host.endswith("."):
+            host = host[:-1]   # one terminal dot names the same host ("nxp.myworkdayjobs.com.")
+        if not host.endswith((".myworkdayjobs.com", ".myworkdaysite.com")):
+            hit = None
+        else:
+            # urlunsplit keeps a scheme-less redirect target ("//host/path") a link: "//", not "://"
+            hit = match_ats_pattern(urlunsplit((parsed.scheme, host, parsed.path, "", "")), own_url=True)
+            if hit and hit["platform"] == "workday":
+                # the tenant must come from the host itself, never from a tenant-like string in the path
+                # (myworkdayjobs: first host label = tenant; myworkdaysite: first host label = wd)
+                try:
+                    found = json.loads(hit["slug"])
+                except (TypeError, ValueError):
+                    found = {}
+                label = host.split(".")[0]
+                site = host.endswith(".myworkdaysite.com")
+                if (found.get("wd", "").lower() if site else str(found.get("slug", "")).lower()) != label:
+                    hit = None
     if not hit:
         return None, "That URL does not match any known ATS pattern — nothing was changed."
     _, err = validate_platform_slug(hit["platform"], hit["slug"])

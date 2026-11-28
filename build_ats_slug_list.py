@@ -193,6 +193,14 @@ def get_recent_crawls(n=CRAWLS_TO_USE):
 # ATHENA QUERY
 # ─────────────────────────────────────────
 
+# Bump whenever MAIN_QUERY changes: it is part of the cached CSV name, so rows produced by an older
+# query are never reused as the current result (q2 = Workday bare hosts added).
+# Forward-only: it does not reopen crawls already in scanned_crawls, so a changed query first runs on
+# the next new crawl. To rescan by hand, delete the wanted crawls' scanned_crawls rows: that only makes
+# a crawl eligible again if its ID is in the current CRAWLS_TO_USE (3) crawl window. Reprocessing it
+# does not necessarily rerun Athena: a CSV cached the same day for this revision is reused instead.
+ATHENA_QUERY_REV = "q2"
+
 MAIN_QUERY = """
 SELECT
     url,
@@ -221,11 +229,15 @@ WHERE crawl  = '{crawl}'
     )
 
     -- Workday: {{slug}}.{{wd}}.myworkdayjobs.com/{{path}}
+    --          and the bare host {{slug}}.myworkdayjobs.com (4th part NULL;
+    --          vendor hosts are dropped later by extract_slug)
     OR (
         url_host_registered_domain = 'myworkdayjobs.com'
-        AND url_host_4th_last_part IS NOT NULL
-        AND url_host_4th_last_part NOT IN (
-            'jobs', 'apply', 'www', 'careers', 'secure'
+        AND (
+            url_host_4th_last_part IS NULL
+            OR url_host_4th_last_part NOT IN (
+                'jobs', 'apply', 'www', 'careers', 'secure'
+            )
         )
     )
 
@@ -485,11 +497,16 @@ def extract_slug(row):
 
     Returns (platform, slug) or None.
     """
-    domain = str(row.get("url_host_registered_domain", "") or "")
-    third  = str(row.get("url_host_3rd_last_part", "") or "")
-    fourth = str(row.get("url_host_4th_last_part", "") or "")
-    fifth  = str(row.get("url_host_5th_last_part", "") or "")
-    path   = str(row.get("url_path", "") or "")
+    def _cell(name):
+        # a cached CSV reads a missing label back as NaN (truthy): treat it as empty, not "nan"
+        v = row.get(name, "")
+        return "" if v is None or (isinstance(v, float) and v != v) else str(v)
+
+    domain = _cell("url_host_registered_domain")
+    third  = _cell("url_host_3rd_last_part")
+    fourth = _cell("url_host_4th_last_part")
+    fifth  = _cell("url_host_5th_last_part")
+    path   = _cell("url_path")
 
     # ── Greenhouse ──────────────────────────────────────
     if domain == "greenhouse.io":
@@ -516,29 +533,36 @@ def extract_slug(row):
 
     # ── Workday ──────────────────────────────────────────
     if domain == "myworkdayjobs.com":
-        tenant = fourth.lower()
-        wd     = third.lower()
+        # {tenant}.{wdN}.myworkdayjobs.com -> 4th=tenant, 3rd=wdN
+        # {tenant}.myworkdayjobs.com (bare) -> 3rd=tenant, 4th empty, stored as wd ""
+        # the missing 4th label is checked first: wd42.myworkdayjobs.com is the bare host of tenant wd42
+        if not fourth.strip():
+            from jobs.ats.patterns import WORKDAY_NON_TENANT
+            if third.lower() in WORKDAY_NON_TENANT:
+                return None   # a vendor/system host, not a tenant
+            tenant = third.lower()
+            wd     = ""
+        elif re.match(r'^wd[0-9]+$', third, re.IGNORECASE):
+            tenant = fourth.lower()
+            wd     = third.lower()
+            if tenant in EXCLUDED_SLUGS:
+                return None
+        else:
+            return None  # skip non-WD subdomains
         # Extract path — skip locale prefix (en-US, en-GB, fr-FR etc.)
         # URLs look like: /en-US/CareerSiteName/job/... OR /CareerSiteName/job/...
         # We want the career site name, not the locale
-        _LOCALE_RE = re.compile(
-            r'^[a-z]{2}[-_][A-Z]{2}$'  # matches en-US, fr-FR, zh-CN etc.
-        )
-        parts = [p for p in path.strip("/").split("/") if p]
-        path_ = ""
-        for part in parts:
-            if not _LOCALE_RE.match(part):
-                path_ = part
-                break  # first non-locale segment is the career site name
+        from jobs.ats.patterns import decode_unreserved, workday_site_segments
+        # "%45xternal" is "External"; an encoded delimiter ("%2F") stays and fails the check below
+        parts = workday_site_segments(
+            [decode_unreserved(p) for p in path.strip("/").split("/")])
+        path_ = parts[0] if parts else ""  # the career site, past locales and /wday/cxs/{tenant}
 
-        if not tenant or tenant in EXCLUDED_SLUGS:
+        if not tenant:
             return None
-        if not re.match(r'^wd[0-9]+$', wd, re.IGNORECASE):
-            return None  # skip non-WD subdomains
         # Validate path_ — reject URL delimiters or scheme patterns
         if (path_ and (
             ":" in path_ or "//" in path_
-            or len(path_) <= 3
             or not re.match(r'^[a-zA-Z0-9_-]+$', path_)
         )):
             path_ = ""  # store empty rather than invalid value
@@ -572,6 +596,11 @@ def extract_slug(row):
         return ("icims", slug)
 
     return None
+
+
+def _read_athena_csv(path):
+    """Cached/--from-csv Athena rows as text: a host label "null" or "na" is a name, not a missing value."""
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
 
 
 def process_dataframe(df, crawl_id):
@@ -920,7 +949,7 @@ def _save_brave_to_db(platform_slugs, crawl_id):
 
 def run_cleanup(window_crawls):
     """
-    Archive and delete slugs not in sliding window.
+    Archive and delete slugs older than the sliding window.
     Only affects source='crawl' rows.
     """
     from db.ats_companies import remove_stale_crawls
@@ -938,7 +967,7 @@ def run_cleanup(window_crawls):
         print(f"\n[CLEANUP] Archived {archived:,} slugs → "
               f"data/ats_archive.csv.gz")
         print(f"[CLEANUP] Deleted {deleted:,} stale slugs "
-              f"from DB (not in last {CRAWLS_TO_USE} crawls)")
+              f"from DB (older than the {CRAWLS_TO_USE}-crawl window)")
     else:
         logger.info("Cleanup: no stale slugs to remove")
         print(f"\n[CLEANUP] No stale slugs to remove")
@@ -1033,6 +1062,7 @@ def main():
     for crawl_id in unscanned:
         csv_path = (f"data/athena_"
                     f"{crawl_id}_"
+                    f"{ATHENA_QUERY_REV}_"
                     f"{datetime.now().strftime('%Y-%m-%d')}"
                     f".csv")
 
@@ -1040,11 +1070,11 @@ def main():
         if args.from_csv and os.path.exists(args.from_csv):
             logger.info("Loading from CSV: %s", args.from_csv)
             print(f"  [CSV] Loading from {args.from_csv}")
-            df = pd.read_csv(args.from_csv)
+            df = _read_athena_csv(args.from_csv)
         elif os.path.exists(csv_path) and not args.test:
             logger.info("Found existing CSV: %s", csv_path)
             print(f"  [CSV] Found existing: {csv_path}")
-            df = pd.read_csv(csv_path)
+            df = _read_athena_csv(csv_path)
         elif args.test:
             logger.info("Test mode: skipping Athena for %s", crawl_id)
             print(f"  [TEST] Skipping Athena for {crawl_id}")

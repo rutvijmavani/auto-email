@@ -54,6 +54,21 @@ class TestPostRecording(unittest.TestCase):
         self.assertEqual(rec.call_args_list[0].kwargs["backoff_s"], 60)
         chk.assert_called_once_with("workday")
 
+    def test_cf_mitigated_429_returns_at_once_without_sleep_or_retry(self):
+        r = self._resp(429)
+        r.headers = {"cf-mitigated": "challenge"}
+        with mock.patch.object(base.requests, "post", side_effect=[r, self._resp(200)]) as post, \
+             mock.patch.object(base.time, "sleep") as slp, \
+             mock.patch.object(base, "_record") as rec, \
+             mock.patch.object(base, "_check_rate_limit_alert") as chk:
+            out = base.fetch_json_post("http://x", platform="workday")
+        self.assertIsNone(out)
+        self.assertEqual(post.call_count, 1)
+        slp.assert_not_called()
+        self.assertEqual([c.args[1] for c in rec.call_args_list], [429])
+        self.assertEqual(rec.call_args_list[0].kwargs["backoff_s"], 0)
+        chk.assert_called_once_with("workday")
+
     def test_get_429_not_double_counted(self):
         with mock.patch.object(base.requests, "get",
                                side_effect=[self._resp(429), self._resp(200)]), \

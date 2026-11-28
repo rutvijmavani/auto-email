@@ -626,8 +626,12 @@ class TestWorkdayClient(unittest.TestCase):
         # total=40, limit=20 → two pages needed
         # Page 1: 20 jobs, offset becomes 20
         # Page 2: 20 jobs, offset becomes 40 >= total → stop
-        page1_jobs = [self._job(url=f"https://x.com/{i}") for i in range(20)]
-        page2_jobs = [self._job(url=f"https://x.com/{i+20}") for i in range(20)]
+        def distinct(i):   # the planner merges by job key (req id), so each job needs its own
+            j = self._job(url=f"https://x.com/{i}")
+            j["bulletFields"] = [f"R-{i}"]
+            return j
+        page1_jobs = [distinct(i) for i in range(20)]
+        page2_jobs = [distinct(i + 20) for i in range(20)]
         p1 = {"jobPostings": page1_jobs, "total": 40}
         p2 = {"jobPostings": page2_jobs, "total": 40}
         mock_fetch.side_effect = [p1, p2]

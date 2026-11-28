@@ -13,6 +13,9 @@ ARCHIVE_FIELDS = [
     "crawl_source", "last_seen_crawl", "source",
     "first_seen", "archived_at",
 ]
+# SET clause that keeps the newer crawl (takes the incoming id twice). Names in the sliding
+# window are CC-MAIN-YYYY-WW, so text order is age order.
+_KEEP_NEWEST_CRAWL = "last_seen_crawl = MAX(COALESCE(last_seen_crawl, ?), ?)"
 
 
 # ─────────────────────────────────────────
@@ -68,10 +71,25 @@ def get_unscanned_crawls(window_crawls):
 # PHASE 1 LOOKUP
 # ─────────────────────────────────────────
 
+def _workday_tenant_site(row):
+    """(tenant, career site) of a Workday row, the site "" for a bare root; None for any other row."""
+    if row["platform"] != "workday":
+        return None
+    try:
+        info = json.loads(row["slug"])
+        tenant = str(info.get("slug") or "").lower()
+        site = str(info.get("path") or "").strip("/")
+    except (TypeError, ValueError, AttributeError):   # not a JSON object: nothing to rank by
+        return None
+    return (tenant, site) if tenant else None
+
+
 def find_company(company_name, platform=None):
     """
     Phase 1 lookup: find ATS slug for a company by name.
     Uses deterministic keyword matching — no fuzzy matching.
+    The first matching row wins, except that one Workday tenant may have several rows: among its
+    matching rows one naming a career site beats the bare root, ties going to the lowest slug.
 
     Returns {platform, slug, company_name} or None.
     """
@@ -99,17 +117,29 @@ def find_company(company_name, platform=None):
                 AND company_name != ''
             """).fetchall()
 
-        for row in rows:
-            if _all_keywords_present(company_name,
-                                     row["company_name"]):
-                return {
-                    "platform":     row["platform"],
-                    "slug":         row["slug"],
-                    "company_name": row["company_name"],
-                    "website":      row["website"],
-                    "job_count":    row["job_count"],
-                }
-        return None
+        def named(row):
+            return _all_keywords_present(company_name, row["company_name"])
+
+        best = next((row for row in rows if named(row)), None)
+        if best is None:
+            return None
+
+        found = _workday_tenant_site(best)
+        if found:
+            same_tenant = [
+                row for row in rows
+                if (_workday_tenant_site(row) or ("",))[0] == found[0] and named(row)
+            ]
+            best = min(same_tenant, key=lambda row: (
+                not _workday_tenant_site(row)[1], row["slug"]))
+
+        return {
+            "platform":     best["platform"],
+            "slug":         best["slug"],
+            "company_name": best["company_name"],
+            "website":      best["website"],
+            "job_count":    best["job_count"],
+        }
 
     finally:
         conn.close()
@@ -187,8 +217,8 @@ def upsert_company(platform, slug, company_name=None,
             params.append(job_count)
 
         if crawl_source is not None:
-            updates.append("last_seen_crawl = ?")
-            params.append(crawl_source)
+            updates.append(_KEEP_NEWEST_CRAWL)
+            params.extend([crawl_source, crawl_source])
 
         # Persist source so detection/backfill rows are never
         # accidentally downgraded to 'crawl' by subsequent updates
@@ -227,7 +257,7 @@ def bulk_insert_slugs(platform, slugs, crawl_source):
     """
     Bulk insert slugs from Athena results.
     INSERT OR IGNORE — never overwrites existing data.
-    Updates last_seen_crawl for existing rows.
+    Moves last_seen_crawl of existing rows forward only: crawls may be scanned in any order.
 
     Returns count of newly inserted rows.
     """
@@ -250,11 +280,11 @@ def bulk_insert_slugs(platform, slugs, crawl_source):
                 added += 1
             else:
                 # Update last_seen_crawl for existing rows
-                conn.execute("""
+                conn.execute(f"""
                     UPDATE ats_companies
-                    SET last_seen_crawl = ?
+                    SET {_KEEP_NEWEST_CRAWL}
                     WHERE platform = ? AND slug = ?
-                """, (crawl_source, platform, str(slug)))
+                """, (crawl_source, crawl_source, platform, str(slug)))
 
         conn.commit()
         return added
@@ -318,12 +348,14 @@ def delete_company(platform, slug):
 
 def get_stale_slugs(keep_crawls):
     """
-    Get slugs not seen in recent crawls.
+    Get slugs last seen before the oldest crawl in the window.
+    Crawl IDs (CC-MAIN-YYYY-WW) sort in date order, so a row seen in a
+    crawl newer than the window (a stale or fallback window) is kept.
     Only returns source='crawl' rows — detection/manual
     entries are never subject to sliding window cleanup.
 
     Args:
-        keep_crawls: list of crawl IDs to keep
+        keep_crawls: list of crawl IDs in the active window
 
     Returns:
         list of row dicts to archive then delete
@@ -331,17 +363,16 @@ def get_stale_slugs(keep_crawls):
     if not keep_crawls:
         return []
 
-    placeholders = ",".join("?" * len(keep_crawls))
     conn = get_discovery_conn()
     try:
-        rows = conn.execute(f"""
+        rows = conn.execute("""
             SELECT platform, slug, company_name,
                    website, crawl_source,
                    last_seen_crawl, source, first_seen
             FROM ats_companies
-            WHERE last_seen_crawl NOT IN ({placeholders})
+            WHERE last_seen_crawl < ?
             AND source = 'crawl'
-        """, keep_crawls).fetchall()
+        """, (min(keep_crawls),)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -383,7 +414,7 @@ def archive_stale_slugs(stale_rows):
 
 def remove_stale_crawls(keep_crawls):
     """
-    Archive then delete slugs not in sliding window.
+    Archive then delete slugs older than the sliding window.
 
     Flow:
       1. Find stale slugs (source='crawl' only)
@@ -401,14 +432,13 @@ def remove_stale_crawls(keep_crawls):
     archived = archive_stale_slugs(stale_rows)
 
     # Delete from DB
-    placeholders = ",".join("?" * len(keep_crawls))
     conn = get_discovery_conn()
     try:
-        result = conn.execute(f"""
+        result = conn.execute("""
             DELETE FROM ats_companies
-            WHERE last_seen_crawl NOT IN ({placeholders})
+            WHERE last_seen_crawl < ?
             AND source = 'crawl'
-        """, keep_crawls)
+        """, (min(keep_crawls),))
         conn.commit()
         deleted = result.rowcount
     finally:

@@ -134,6 +134,80 @@ class TestBuildDetailPayloadKeyForwarding(unittest.TestCase):
         with self.assertRaises(ValueError):
             _build_detail_payload("Acme", "workday", job, {})
 
+    def test_workday_empty_wd_bare_host_forwarded(self):
+        """_wd="" (bare host, e.g. nxp.myworkdayjobs.com) is valid: forwarded as ""."""
+        job = _minimal_job(_external_path="/job/x", _slug="nxp", _wd="", _path="careers")
+        payload = _build_detail_payload("NXP", "workday", job, {"slug": "nxp"})
+        self.assertIn("_wd", payload)
+        self.assertEqual(payload["_wd"], "")
+
+    def test_workday_missing_wd_key_raises(self):
+        """A job with no _wd key at all is still an error."""
+        job = _minimal_job(_external_path="/job/x", _slug="nxp", _path="careers")
+        job.pop("_wd", None)
+        with self.assertRaises(ValueError):
+            _build_detail_payload("NXP", "workday", job, {})
+
+    def test_workday_empty_wd_myworkdaysite_raises(self):
+        """Empty wd is not valid for myworkdaysite."""
+        job = _minimal_job(_external_path="/job/x", _slug="nxp", _wd="",
+                           _path="careers", _site="myworkdaysite")
+        with self.assertRaises(ValueError):
+            _build_detail_payload("NXP", "workday", job, {})
+
+    def test_should_fetch_detail_empty_wd(self):
+        from jobs.ats.registry import should_fetch_detail, detail_key_present
+        job = _minimal_job(_external_path="/job/x", _slug="nxp", _wd="", _path="careers")
+        self.assertTrue(detail_key_present("workday", "_wd", job))
+        self.assertTrue(should_fetch_detail(job, "workday", {"has_detail": True}))
+        job.pop("_wd")
+        self.assertFalse(detail_key_present("workday", "_wd", job))
+
+    def test_purge_stale_empty_wd_not_stale(self):
+        import json
+        from scripts.purge_stale_detail_payloads import _is_stale_workday
+        ok = {"ats_platform": "workday", "_slug": "nxp", "_wd": "", "_path": "careers"}
+        self.assertFalse(_is_stale_workday(json.dumps(ok)))
+        ok.pop("_wd")
+        self.assertTrue(_is_stale_workday(json.dumps(ok)))
+
+    def test_purge_null_slug_is_stale(self):
+        import json
+        from scripts import purge_stale_detail_payloads as purge
+        bad = {"ats_platform": "workday", "_slug": None, "_wd": "", "_path": "careers"}
+        good = {"ats_platform": "workday", "_slug": "nxp", "_wd": "", "_path": "careers"}
+
+        class FakeRedis:
+            def lrange(self, key, a, b):
+                return [json.dumps(bad), json.dumps(good)]
+        self.assertEqual(purge._purge_list(FakeRedis(), "q", dry_run=True), (2, 1))
+
+    @unittest.skipUnless(os.getenv("TEST_REDIS_URL"), "TEST_REDIS_URL not set (needs a throwaway Redis)")
+    def test_purge_apply_matches_dry_run(self):
+        """The Lua filter (apply) removes exactly what the Python check (dry run) counts."""
+        import json
+        import uuid
+        import redis
+        from scripts import purge_stale_detail_payloads as purge
+        good = {"ats_platform": "workday", "_slug": "nxp", "_wd": "", "_path": "careers"}
+        bad = [dict(good, **{key: value})
+               for key in ("_slug", "_path")
+               for value in (None, "", 0, 0.0, False, [], {})]
+        bad.append({k: v for k, v in good.items() if k != "_wd"})
+        bad.append(dict(good, _site="myworkdaysite"))
+        keep = [json.dumps(good), json.dumps(dict(good, _slug=1)),
+                json.dumps({"ats_platform": "lever", "_slug": 0}), json.dumps("workday"), "not json"]
+        r = redis.Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=True)
+        key = f"test:purge:{uuid.uuid4().hex}"
+        try:
+            r.rpush(key, *[json.dumps(job) for job in bad], *keep)
+            expected = (len(bad) + len(keep), len(bad))
+            self.assertEqual(purge._purge_list(r, key, dry_run=True), expected)
+            self.assertEqual(purge._purge_list(r, key, dry_run=False), expected)
+            self.assertEqual(r.lrange(key, 0, -1), keep)
+        finally:
+            r.delete(key)
+
     def test_taleo_keys_forwarded(self):
         """Taleo required keys: _base_url, _contest_no, _section."""
         job = _minimal_job(
@@ -258,8 +332,8 @@ class TestGuardClauseSilentFailure(unittest.TestCase):
                       "_slug='' should cause guard to fire; returned a different object")
 
     def test_workday_guard_fires_missing_wd(self):
-        """_wd missing (falsy) → guard fires."""
-        job = {"_slug": "acme", "_wd": "", "_path": "careers",
+        """_wd key missing → guard fires (an empty string is the bare host and is valid)."""
+        job = {"_slug": "acme", "_path": "careers",
                "_external_path": "/job/Austin/Test_R-123"}
         result = workday.fetch_job_detail(job)
         self.assertIs(result, job)

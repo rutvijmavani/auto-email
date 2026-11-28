@@ -84,7 +84,7 @@ from workers.queue_stamp import payload_wait_s
 from workers import progress
 from workers.http_client import set_request_context, CeilingExceeded
 from jobs.ats_detector import get_ats_module
-from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
+from jobs.ats.registry import detail_key_present, get_config, parse_slug, should_fetch_detail
 from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location, is_fresh,
 )
@@ -601,7 +601,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         # jobs, custom jobs that already have a description) should fall through.
         _pre_missing = [
             k for k in _REQUIRED_DETAIL_KEYS.get(platform, [])
-            if not job.get(k)
+            if not detail_key_present(platform, k, job)
         ]
         if (
             not detail_attempted
@@ -662,7 +662,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
             #   jobvite:         not job_url  (same; _slug is only gate key)
             _missing = [
                 k for k in _REQUIRED_DETAIL_KEYS.get(platform, [])
-                if not job.get(k)
+                if not detail_key_present(platform, k, job)
             ]
             if _missing:
                 logger.error(

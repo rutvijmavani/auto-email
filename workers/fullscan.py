@@ -42,8 +42,9 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     title+location -> save_pending_detail.  adaptive_seen is deleted when the fullscan FINISHES.
 
     On completion: one RENAME promotes NEW over OLD (also after an incomplete fetch: a job
-                   missing from the bloom is just re-evaluated next scan).
-    On resume:     both keys are preserved; NEW bloom provides intra-scan dedup
+                   missing from the bloom is just re-evaluated next scan).  Not for an
+                   unusable ATS config (STOP_NO_CONFIG): both stay, no adaptive bootstrap.
+    On resume:    both keys are preserved; NEW bloom provides intra-scan dedup
                    so jobs queued before the pause are not re-queued.
 
 ─── Order for a new company ──────────────────────────────────────────────────
@@ -139,9 +140,9 @@ from workers.scheduler import (
 )
 from workers.paginator import estimate_scan_depth
 from jobs.ats_detector import get_ats_module
-from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
+from jobs.ats.registry import detail_key_present, get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
-from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_REQUEST_FAILED, FetchReport, report_of
+from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REQUEST_FAILED, FetchReport, report_of
 from db.scan_health import SOURCE_FULLSCAN, annotate_latest, record_scan
 from workers.http_client import CeilingExceeded
 from jobs.job_filter import filter_jobs, filter_jobs_title_only, passes_listing_date
@@ -610,12 +611,17 @@ def _complete_fullscan_db(
     duration_s: float,
     prev_avg_duration_s: float = _AVG_DURATION_SEED,
     next_scan_ts: float = 0.0,
+    keep_checkpoint: bool = False,
 ) -> bool:
     """
     Update company_poll_stats on successful full scan completion.
 
     Sets last_full_scan_at, next_full_scan_at, clears interrupted flag,
     increments total_new_jobs, and updates the scan duration EMA.
+
+    keep_checkpoint: leave full_scan_interrupted and the page checkpoint of an
+        existing row as they are (a run that fetched nothing must not make the
+        next scan start fresh and wipe the partial NEW bloom).
 
     next_scan_ts: exact Unix timestamp written to Redis by _atomic_schedule.
         When provided (non-zero), it is persisted directly so the DB and Redis
@@ -652,16 +658,18 @@ def _complete_fullscan_db(
                 ats_platform             = EXCLUDED.ats_platform,
                 last_full_scan_at        = NOW(),
                 next_full_scan_at        = to_timestamp(%s::double precision),
-                full_scan_interrupted    = FALSE,
-                interrupted_at_page      = NULL,
-                interrupted_at           = NULL,
                 total_new_jobs           = COALESCE(company_poll_stats.total_new_jobs, 0) + %s,
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
+                full_scan_interrupted    = CASE WHEN %s THEN company_poll_stats.full_scan_interrupted
+                                                ELSE FALSE END,
+                interrupted_at_page      = CASE WHEN %s THEN company_poll_stats.interrupted_at_page END,
+                interrupted_at           = CASE WHEN %s THEN company_poll_stats.interrupted_at END,
                 updated_at               = NOW()
             """
             _params = (company, platform, next_scan_ts, new_jobs, int(duration_s), new_avg,
-                       next_scan_ts, new_jobs, int(duration_s), new_avg)
+                       next_scan_ts, new_jobs, int(duration_s), new_avg,
+                       keep_checkpoint, keep_checkpoint, keep_checkpoint)
         else:
             _sql = """
             INSERT INTO company_poll_stats
@@ -678,16 +686,18 @@ def _complete_fullscan_db(
                 ats_platform             = EXCLUDED.ats_platform,
                 last_full_scan_at        = NOW(),
                 next_full_scan_at        = NOW() + (%s * INTERVAL '1 second'),
-                full_scan_interrupted    = FALSE,
-                interrupted_at_page      = NULL,
-                interrupted_at           = NULL,
                 total_new_jobs           = COALESCE(company_poll_stats.total_new_jobs, 0) + %s,
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
+                full_scan_interrupted    = CASE WHEN %s THEN company_poll_stats.full_scan_interrupted
+                                                ELSE FALSE END,
+                interrupted_at_page      = CASE WHEN %s THEN company_poll_stats.interrupted_at_page END,
+                interrupted_at           = CASE WHEN %s THEN company_poll_stats.interrupted_at END,
                 updated_at               = NOW()
             """
             _params = (company, platform, interval_s, new_jobs, int(duration_s), new_avg,
-                       interval_s, new_jobs, int(duration_s), new_avg)
+                       interval_s, new_jobs, int(duration_s), new_avg,
+                       keep_checkpoint, keep_checkpoint, keep_checkpoint)
 
         conn.execute(_sql, _params)
         conn.commit()
@@ -781,7 +791,8 @@ def _build_detail_payload(
         # Truthiness, same as scan_worker._build_detail_payload (BDP): an empty
         # string is "absent" for the fetch_job_detail guards (`not all([...])`),
         # so both tiers must drop it the same way.
-        if job.get(key):
+        # Workday `_wd` is the exception: "" is the bare host and must be forwarded.
+        if detail_key_present(platform, key, job):
             payload[key] = job[key]
 
     if job.get("_country_code"):
@@ -797,7 +808,8 @@ def _build_detail_payload(
         "icims":           ["_base_url"],
         "jobvite":         ["_slug"],
     }
-    _missing_required = [k for k in _REQUIRED.get(platform, []) if not payload.get(k)]
+    _missing_required = [k for k in _REQUIRED.get(platform, [])
+                         if not detail_key_present(platform, k, payload)]
     if _missing_required:
         raise ValueError(
             f"detail payload missing required keys for {company!r}/{platform} "
@@ -1132,6 +1144,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             # repeat page, shortfall) would loop forever, so it completes normally with its verdict recorded.
             # A failure that never clears gets the same treatment once the retry budget is spent.
             _partial_fetch = _partial_retry_allowed(r, company)
+        # Unusable slug / undiscoverable target: nothing was fetched, so this scan is no view of the board.
+        _no_config = _report.complete is False and _report.stop_reason == STOP_NO_CONFIG
         record_scan(
             company, platform, SOURCE_FULLSCAN, _report,
             raw_count=len(raw_jobs), valid_count=len(valid_jobs),
@@ -1330,14 +1344,22 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             # Scan completed — a later transient failure gets a fresh retry budget.
             _clear_partial_retries(r, company)
 
-            # Promote NEW bloom → OLD with one RENAME (the gate for the next fullscan and the
-            # adaptive stop test). Always, even after an incomplete fetch: a job missing from the
-            # bloom is simply re-evaluated next scan.
-            bloom.finalize()
-            # The fullscan has now seen everything adaptive handled meanwhile.
-            # (An ID adaptive adds after this scan's last read but before this delete is lost,
-            # so a rejected job may be queued once more: accepted.)
-            r.delete(adaptive_seen_key)
+            if _no_config:
+                # Not an empty board: the last completed baseline stays (old bloom and adaptive_seen),
+                # so a repaired slug does not re-evaluate everything already handled.
+                logger.warning(
+                    "fullscan [%s]: unusable ATS config (%s) — nothing fetched, bloom and adaptive_seen kept",
+                    company, _report.note,
+                )
+            else:
+                # Promote NEW bloom → OLD with one RENAME (the gate for the next fullscan and the
+                # adaptive stop test). Also after an incomplete fetch: a job missing from the
+                # bloom is simply re-evaluated next scan.
+                bloom.finalize()
+                # The fullscan has now seen everything adaptive handled meanwhile.
+                # (An ID adaptive adds after this scan's last read but before this delete is lost,
+                # so a rejected job may be queued once more: accepted.)
+                r.delete(adaptive_seen_key)
 
             # Reschedule using gap-detection algorithm (Phase 2 — thundering herd prevention).
             #
@@ -1381,6 +1403,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 duration_s          = duration_s,
                 prev_avg_duration_s = avg_duration_s,   # DB function recomputes EMA
                 next_scan_ts        = next_scan_at,     # exact Redis score → no drift
+                # nothing was fetched: an interrupted scan still resumes with its partial bloom
+                keep_checkpoint     = _no_config,
             )
 
             if db_ok:
@@ -1405,7 +1429,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 # ── Bootstrap new companies into WARMING adaptive cycle ───────
                 # Only after successful DB write — adaptive polling must start
                 # from a persisted baseline, not an in-memory-only scan result.
-                if is_first_fullscan:
+                if is_first_fullscan and not _no_config:
                     try:
                         _bootstrap_warming_adaptive(company, r)
                     except Exception as bw_exc:
@@ -1429,7 +1453,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
 
                 # Daily digest: this scan saw the whole board, so its counts are
                 # the company's "jobs fetched / matched" (see workers/digest_counts).
-                record_fullscan_counts(r, company, len(valid_jobs), len(title_matched))
+                if not _no_config:
+                    record_fullscan_counts(r, company, len(valid_jobs), len(title_matched))
 
                 # Sync prospective_companies.last_checked_at and
                 # consecutive_empty_days so the monitor table reflects actual
@@ -1437,6 +1462,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 # "Empty" means the ATS returned no jobs at all (valid_jobs), never
                 # "no job matched our title filter": a big board with no matching
                 # titles is healthy and must not drift toward ATS re-detection.
+                # An unusable config counts as empty on purpose (as in jobs/job_monitor.py):
+                # re-detection is what repairs it.
                 try:
                     from db.job_monitor import update_company_check
                     update_company_check(company, found_jobs=(len(valid_jobs) > 0))

@@ -518,13 +518,13 @@ def query_scaling_effectiveness(days: int = 7) -> list:
                 SUM(CASE WHEN event_type = 'outage_end'      THEN 1 ELSE 0 END)
                                                                     AS outages_resolved,
                 ROUND(
-                    AVG(CASE WHEN event_type = 'worker_remove'
-                             THEN error_rate ELSE NULL END) * 100,
+                    (AVG(CASE WHEN event_type = 'worker_remove'
+                              THEN error_rate ELSE NULL END) * 100)::numeric,
                     1
                 )                                                   AS avg_error_at_reduce,
                 ROUND(
-                    AVG(CASE WHEN event_type = 'ceiling_learned'
-                             THEN error_rate ELSE NULL END) * 100,
+                    (AVG(CASE WHEN event_type = 'ceiling_learned'
+                              THEN error_rate ELSE NULL END) * 100)::numeric,
                     1
                 )                                                   AS avg_error_at_recovery
             FROM worker_scaling_events
