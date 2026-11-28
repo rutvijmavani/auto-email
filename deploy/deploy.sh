@@ -86,26 +86,41 @@ _user_cron_lines() {   # $1 = crontab text
 }
 
 _restore_user_cron() {   # $1 = the user's lines, saved before the old setup_cron.sh ran
-    local saved="$1" current outside line merged missing=false
+    local saved="$1" current outside extra line path keep="" merged missing=false conflict=false
+    local stripped='/home/opc/mail/run_[a-z_]*\.sh'   # all an old setup_cron.sh takes from these lines
     [[ -n "$saved" ]] || return 0
     if current=$(crontab -l 2>/dev/null); then
         # a line counts as present only outside the pipeline block
         outside=$(sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d' <<<"$current")
+        extra=$(grep -vxF -e "$saved" <<<"$outside" || true)   # installed now, not in the backup
         while IFS= read -r line; do
-            grep -qxF -- "$line" <<<"$outside" || missing=true
+            if ! grep -qxF -- "$line" <<<"$outside"; then
+                # any other missing line was removed or replaced by hand since the backup: it stays so
+                grep -q -- "$stripped" <<<"$line" || continue
+                # a line the backup does not have naming the same script: the missing one was edited
+                for path in $(grep -o -- "$stripped" <<<"$line"); do
+                    if grep -qF -- "$path" <<<"$extra"; then conflict=true; fi
+                done
+                missing=true
+            fi
+            keep+="$line"$'\n'
         done <<<"$saved"
         $missing || return 0
         # the saved lines first, in their own order, then every other line installed now (the pipeline
         # block included): nothing that is in the crontab is dropped
-        merged=$(SAVED="$saved" awk '
-            BEGIN { n = split(ENVIRON["SAVED"], s, "\n"); for (i = 1; i <= n; i++) { print s[i]; have[s[i]]++ } }
-            /# === BEGIN RECRUITER PIPELINE ===/ { block = 1 }
-            !block && have[$0] > 0 { have[$0]--; next }
-            { print }
-            /# === END RECRUITER PIPELINE ===/ { block = 0 }
-        ' <<<"$current") && printf '%s\n' "$merged" | crontab - && return 0
+        if ! $conflict; then
+            merged=$(SAVED="${keep%$'\n'}" awk '
+                BEGIN { n = split(ENVIRON["SAVED"], s, "\n"); for (i = 1; i <= n; i++) { print s[i]; have[s[i]]++ } }
+                /# === BEGIN RECRUITER PIPELINE ===/ { block = 1 }
+                !block && have[$0] > 0 { have[$0]--; next }
+                { print }
+                /# === END RECRUITER PIPELINE ===/ { block = 0 }
+            ' <<<"$current") && printf '%s\n' "$merged" | crontab - && return 0
+        fi
     fi
-    echo "  [WARN] could not restore your own crontab lines — check 'crontab -l' and add back any of these:"
+    echo "  [WARN] could not restore your own crontab lines (unreadable crontab, failed write, or a line"
+    echo "         edited since the backup) — check 'crontab -l', add back what you still need from these,"
+    echo "         then delete $_CRON_USER_BACKUP :"
     printf '%s\n' "$saved"
     return 1
 }

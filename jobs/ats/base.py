@@ -179,23 +179,30 @@ def fetch_json_post(url, body=None, retries=2,
             status_code = resp.status_code
             elapsed_ms  = int(time.time() * 1000) - start_ms
 
-            if status_code == 429:
-                # A Cloudflare challenge (cf-mitigated header) is not a rate
-                # limit: waiting 60 s and retrying the same request never
-                # clears it. Record it once (backoff 0, no sleep happened),
-                # run the alert check and give up at once so the caller marks
-                # the fetch incomplete. Only a real string value counts.
+            if status_code != 200:
+                # A Cloudflare challenge (cf-mitigated header), whatever its status
+                # (403, 429, 503), is neither a rate limit nor a passing error:
+                # waiting and retrying the same request never clears it. Record it
+                # once (a 429 with backoff 0, no sleep happened, plus the alert
+                # check) and give up at once so the caller marks the fetch
+                # incomplete. Only a real string value counts.
                 cf_header = resp.headers.get("cf-mitigated")
                 if isinstance(cf_header, str) and cf_header:
                     if platform and track:
-                        _record(platform, 429, elapsed_ms, backoff_s=0)
-                        _check_rate_limit_alert(platform)
+                        if status_code == 429:
+                            _record(platform, 429, elapsed_ms, backoff_s=0)
+                            _check_rate_limit_alert(platform)
+                        else:
+                            _record(platform, status_code, elapsed_ms,
+                                    error_type=_status_error_type(status_code))
                     logger.warning(
                         "Cloudflare challenge (cf-mitigated=%s) on %s (POST) — not retrying",
                         cf_header, platform or url
                     )
                     _post_state.challenge = True
                     return None
+
+            if status_code == 429:
                 # Same single-record rule as fetch_json; Workday (the main
                 # caller) previously recorded no backoff and never ran the
                 # rate-limit alert check.

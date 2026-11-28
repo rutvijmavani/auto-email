@@ -15,7 +15,7 @@ Rules (agreed 2026-10-12):
   * A pasted job URL that matches no known pattern writes nothing.
 """
 import json
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunsplit
 
 from config import DISCOVERY_REDETECT, ENRICHMENT_ON_DEMAND
 from db.connection import get_conn
@@ -99,7 +99,8 @@ def match_job_url(job_url: str) -> "tuple[dict | None, str | None]":
         if not host.endswith((".myworkdayjobs.com", ".myworkdaysite.com")):
             hit = None
         else:
-            hit = match_ats_pattern(f"{parsed.scheme}://{host}{parsed.path}", own_url=True)
+            # urlunsplit keeps a scheme-less redirect target ("//host/path") a link: "//", not "://"
+            hit = match_ats_pattern(urlunsplit((parsed.scheme, host, parsed.path, "", "")), own_url=True)
             if hit and hit["platform"] == "workday":
                 # the tenant must come from the host itself, never from a tenant-like string in the path
                 # (myworkdayjobs: first host label = tenant; myworkdaysite: first host label = wd)

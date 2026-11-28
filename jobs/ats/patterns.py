@@ -24,7 +24,8 @@ WORKDAY_NON_TENANT = frozenset({
 
 # What may follow a whole URL path segment: the end, the next URL part, what closes a link in text or
 # markup, or sentence punctuation. Anything else ("fmr+test") means the segment goes on.
-URL_SEGMENT_END = r"""(?=$|[/?#&\s"'<>\\)\]}|`]|[.,;:!](?![a-z0-9]))"""
+URL_SEGMENT_END = r"""(?=$|[/?#&\s"'<>\\)\]}|`*]|[^\w\x00-\x7f]|[.,;:!](?![a-z0-9]))"""
+_SEGMENT_END = re.compile(URL_SEGMENT_END, re.IGNORECASE)
 
 _SITEMAP_MARKER = r"(?:sitemap[^\s]*\.xml|feed\.xml)"   # what makes a URL a sitemap / XML feed
 
@@ -73,6 +74,16 @@ def workday_site(path):
     parts = workday_site_segments(
         decode_unreserved(p).rstrip(".,;:!") for p in (path or "").split("/"))
     return parts[0] if parts else ""
+
+
+def workday_site_cut(m):
+    """True when the Workday match `m` (WORKDAY_PATH is group 3) stops inside the segment that would
+    name the site ("External+Preview"): such a link names a site that cannot be read, so it counts
+    neither for the part read nor for the tenant root. Shared by patterns.py and career_detector.py."""
+    path = m.group(3)
+    if not path or path.endswith("/") or _SEGMENT_END.match(m.string, m.end(3)):
+        return False
+    return not workday_site(path.rpartition("/")[0])   # a segment after the site may be cut short
 
 
 # where one URL or word ends in HTML/JS/JSON text (literal escapes and quote/angle entities included)
@@ -197,7 +208,7 @@ def _make_patterns():
     def _workday_slug(m):
         tenant = m.group(1).lower()
         wd     = (m.group(2) or "").lower()   # "" = bare host ({tenant}.myworkdayjobs.com)
-        if not wd and tenant in WORKDAY_NON_TENANT:
+        if (not wd and tenant in WORKDAY_NON_TENANT) or workday_site_cut(m):
             return None
         return json.dumps({
             "slug": tenant,
@@ -228,6 +239,8 @@ def _make_patterns():
     # e.g. wd1.myworkdaysite.com/recruiting/fmr/FidelityCareers/...
     # API: wd1.myworkdaysite.com/wday/cxs/{tenant}/{career_site}/jobs
     def _workdaysite_slug(m):
+        if workday_site_cut(m):
+            return None
         wd     = m.group(1).lower()
         tenant = m.group(2).lower()
         return json.dumps({

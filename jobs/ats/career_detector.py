@@ -281,6 +281,7 @@ from jobs.ats.patterns import WORKDAY_PATH as _WORKDAY_PATH
 from jobs.ats.patterns import is_site_link as _is_site_link
 from jobs.ats.patterns import is_url_authority as _is_url_authority
 from jobs.ats.patterns import workday_site as _workday_site
+from jobs.ats.patterns import workday_site_cut as _workday_site_cut
 
 
 def _extract_workday(text):
@@ -295,6 +296,8 @@ def _extract_workday(text):
     ):
         if not m.group(2) and m.group(1).lower() in _WORKDAY_NON_TENANT:
             continue   # jobs./apply./www. aggregator hosts are not tenants
+        if _workday_site_cut(m):
+            continue   # an unreadable site name: neither a site nor a root
         path = _workday_site(m.group(3))   # "" for a locale-only URL (e.g. /en-US/)
         if not path:
             # a root says nothing but its host, so it counts only as a URL's own host
@@ -310,14 +313,16 @@ def _extract_workday(text):
     for m in re.finditer(
         # the locale may sit before /recruiting/ or after the tenant
         # (?<![a-z0-9.-]): wd1 must start the hostname ("team.wd1.myworkdaysite.com" is not it)
-        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com\.?(?::\d+)?/(?:(?-i:' + _URL_LOCALE_SEGMENT + r')/)?'
+        r'(?<![a-z0-9.-])(wd\d+)\.myworkdaysite\.com\.?(?::\d+)?/(?:' + _URL_LOCALE_SEGMENT + r'/)?'
         r'recruiting/([a-z0-9-]+)'
         + _URL_SEGMENT_END +   # the whole tenant segment; the URL may end right after it
         r'(?:/' + _WORKDAY_PATH + r')?',
         text, re.IGNORECASE,
     ):
+        if _workday_site_cut(m):
+            continue   # an unreadable site name: neither a site nor a root
         path = _workday_site(m.group(3))   # "" for a locale-only URL
-        info = {"slug": m.group(2), "wd": m.group(1), "path": path or "careers", "site": "myworkdaysite"}
+        info ={"slug": m.group(2), "wd": m.group(1), "path": path or "careers", "site": "myworkdaysite"}
         if path:
             if _is_site_link(text, m.start()):
                 return {"platform": "workday", "slug": json.dumps(info)}

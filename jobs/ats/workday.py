@@ -260,7 +260,8 @@ def fetch_jobs(slug_info, company, stop_check=None):
         pages            = rep["pages"],
         fetched_distinct = count_distinct(results),
         unusable         = len(all_jobs) - len(results),
-        reported_total   = rep["expected"] if split else rep.get("reported", 0),
+        # split: the root node's target as it stands now (nodes[0] is the root)
+        reported_total   = _node_target(nodes[0], rep) if split else rep.get("reported", 0),
         total_source     = TOTAL_FACET_SUM if split else TOTAL_ATS,
         note             = "; ".join(notes),
     ))
@@ -293,13 +294,14 @@ def _own_url_key(url):
 def _job_key(posting):
     """Identity of a listing across facet slices: its relative path or posting URL, else req id, else its
     title+location (with any other URL and bullets, so a URL or label shared by postings merges none),
-    encoded as a JSON list so that no two splits of those fields read the same."""
+    encoded as a JSON list so that no two splits of those fields read the same. A path is compared with
+    its unreserved escapes decoded ("%45ng" is "Eng"); the posting keeps it as written."""
     if posting.get("externalPath"):
-        return posting["externalPath"]
+        return decode_unreserved(str(posting["externalPath"]))
     url = posting.get("externalUrl") or ""
     own = _own_url_key(url)
     if own:
-        return own
+        return decode_unreserved(own)
     bullets = posting.get("bulletFields") or []
     if bullets and _is_req_id(bullets[0]):
         return bullets[0]
@@ -592,7 +594,9 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     rows past the cap included, and _recover decides whether a node holding it is short; only a slice
     whose highest total is exactly the cap sets rep["capped"], as its real count is unknown (a capped
     tenant reports the cap for anything larger). A total of 0 (later pages often report none) or a lower
-    one is ignored.
+    one does not change the paging. A slice paged without early exit whose every reported total is below
+    its promise has shrunk: the drop is recorded in rep["shrunk_leaves"] (applied, drop), which offsets
+    the rises of the leaves beside it (_node_target).
     """
     got = {}
     leaf_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
@@ -623,13 +627,15 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
     asked = 0   # offsets of `offs` already requested
     probed = False   # the cap probe is sent at most once per leaf
     page1 = first    # page 1's rows, what a cap probe compares against: the cached page, else offset 0's
+    said = 0   # the highest total any response of this leaf reported
 
     def follow(data, off):
         """Raise the promise to the higher total of the response at `off`, adding the offsets it now needs."""
-        nonlocal size, highest, probed, page1
+        nonlocal size, highest, probed, page1, said
         if off == 0 and not page1:
             page1 = (data or {}).get("jobPostings")   # kept now: a later page may be the one reporting growth
         total = (data or {}).get("total") or 0
+        said = max(said, total)
         if not leaf.get("grows") or total <= size:
             return
         if not leaf.get("split"):   # a slice's total is not the board's
@@ -706,6 +712,9 @@ def _fetch_leaf(url, leaf, company, rep, gate=None, norm=None):
         rep.setdefault("early_leaves", []).append((leaf["applied"], len(got) + unrequested, len(got)))
     if not stopped and len(got) != size:
         rep.setdefault("leaf_mismatch", []).append((leaf["applied"], size, len(got)))
+    # an early-exited leaf is left out: its skip credit already covers the rows it no longer holds
+    if leaf.get("split") and not stopped and 0 < said < leaf["K"] and len(got) < leaf["K"]:
+        rep.setdefault("shrunk_leaves", []).append((leaf["applied"], leaf["K"] - max(said, len(got))))
     if leaf.get("split") and highest == WORKDAY_RESULT_CAP > leaf["K"] and rep.get("capped_board") is not False:
         rep["capped"] = True   # grew to exactly the cap: how many lie past it is unknown, so no node can check
     return got
@@ -773,6 +782,16 @@ def _node_union(applied, leaf_got, merged):
         if all(leaf_applied.get(a) == b for a, b in applied.items()):
             union |= keys
     return {k for k in union if (merged.get(k) or {}).get("title")}
+
+
+def _node_target(node, rep):
+    """A split node's coverage target: its promised count, raised by the net change of the leaves inside
+    it (rises in rep["grown_leaves"] less drops in rep["shrunk_leaves"], so jobs that only moved between
+    slices raise nothing). Never below the promise: a node that is short stays short."""
+    def net(key):
+        return sum(n for e, n in rep.get(key) or []
+                   if all(e.get(a) == b for a, b in node["applied"].items()))
+    return node["K"] + max(0, net("grown_leaves") - net("shrunk_leaves"))
 
 
 def _search_node(url, node, merged, leaf_got, tol, company, rep, skipped=0):
@@ -868,18 +887,16 @@ def _recover(url, nodes, merged, leaf_got, company, rep):
     only for nodes up to WORKDAY_WINDOW_MAX x the cap); else searchText. A node still short is recorded
     in rep["partial"] and sets rep["capped"]; that is judged after the last node, because a parent's rows
     can give a title to a child's titleless one. What an early-exited leaf inside the node skipped on purpose
-    (rep["early_leaves"]: applied, K, got) is not counted as a gap; short sibling leaves still are. A leaf
-    that rose above its promise (rep["grown_leaves"]) raises the node's count by as much, so its extra rows
+    (rep["early_leaves"]: applied, K, got) is not counted as a gap; short sibling leaves still are. Leaves
+    that grew by more than their siblings shrank raise the node's count (_node_target), so their extra rows
     cannot stand in for rows a sibling lost.
     """
     early = rep.get("early_leaves") or []
-    grown = rep.get("grown_leaves") or []
     short = []   # (applied, size, tolerance, skip credit) of nodes short when their turn ended
     try:
         for node in sorted(nodes, key=lambda n: -n["depth"]):
             applied = node["applied"]
-            size = node["K"] + sum(rise for e, rise in grown
-                                   if all(e.get(a) == b for a, b in applied.items()))
+            size = _node_target(node, rep)
             # jobs an early-exited leaf inside this node skipped on purpose: not a gap
             skipped = sum(max(0, k - got) for e, k, got in early
                           if all(e.get(a) == b for a, b in applied.items()))
